@@ -1,0 +1,22 @@
+services:
+  ytdl-bot:
+    image: treexhd/ytdl-bot:latest
+    container_name: ytdl-bot
+    restart: unless-stopped
+    volumes:
+      - ./downloads:/app/downloads
+    env_file:
+      - .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  telegram-bot-api:
+    image: aiogram/telegram-bot-api:latest
+    container_name: telegram-bot-api
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./telegram-bot-api-data:/var/lib/telegram-bot-api
+    ports:
+      - "8081:8081"
