@@ -1,2 +1,14 @@
-/downloads
+__pycache__/
+*.py[cod]
+*$py.class
 .env
+.venv
+env/
+venv/
+ENV/
+downloads/
+data/
+.vscode/
+.idea/
+*.swp
+*.log

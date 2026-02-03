@@ -1,18 +1,26 @@
-FROM python:3.12-slim
-
-# Install FFmpeg
-RUN apt-get update && \
-    apt-get install -y ffmpeg && \
-    rm -rf /var/lib/apt/lists/*
+# Base image
+FROM python:3.12.12-alpine3.23
 
 WORKDIR /app
 
-# Install dependencies
-RUN pip install --no-cache-dir yt-dlp python-telegram-bot
+# Install system dependencies
+RUN apk update && apk add --no-cache ffmpeg
 
-# Copy application code
+# Install python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy all application modules
 COPY bot.py .
-# config.json will be mounted via volume to preserve secrets
+COPY config.py .
+COPY database.py .
+COPY downloader.py .
+COPY uploader.py .
+COPY handlers.py .
+COPY queue_processor.py .
+COPY subscription.py .
 
-# Wrapper script to handle config if needed, or just run python
+# Create data directory for SQLite
+RUN mkdir -p /app/data /app/downloads
+
 CMD ["python", "bot.py"]

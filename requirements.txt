@@ -1,0 +1,5 @@
+yt-dlp
+python-telegram-bot
+aiohttp
+aiofiles
+pytest
