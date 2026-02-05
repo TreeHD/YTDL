@@ -5,6 +5,7 @@ services:
     restart: unless-stopped
     volumes:
       - ./downloads:/app/downloads
+      - ./data:/app/data
     env_file:
       - .env
     extra_hosts:
@@ -18,5 +19,6 @@ services:
       - .env
     volumes:
       - ./telegram-bot-api-data:/var/lib/telegram-bot-api
+      - ./downloads:/app/downloads
     ports:
       - "8081:8081"
