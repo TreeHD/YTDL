@@ -359,7 +359,7 @@ def get_live_info(channel_id):
     return None
 
 def get_stream_url(url):
-    """Get the direct stream URL (HLS/Dash)."""
+    """Get the direct stream URL (HLS/Dash) and the proxy used."""
     proxy_list = get_proxy_list()
     for proxy in proxy_list:
         ydl_opts = {
@@ -373,7 +373,7 @@ def get_stream_url(url):
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
-                return info.get('url')
+                return info.get('url'), proxy
         except:
             continue
-    return None
+    return None, None

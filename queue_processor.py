@@ -288,7 +288,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
     try:
         await update_status_msg("🔍 Getting live stream URL...", force=True)
         loop = asyncio.get_running_loop()
-        stream_url = await loop.run_in_executor(None, lambda: get_stream_url(url))
+        stream_url, proxy_used = await loop.run_in_executor(None, lambda: get_stream_url(url))
         if not stream_url:
             await update_status_msg("❌ Could not extract stream URL.", force=True)
             return
@@ -297,7 +297,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
         segment_template = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_%03d.mp4")
         
-        # Start ffmpeg as a subprocess
+        # Start ffmpeg as a subprocess with proxy support if needed
         cmd = [
             get_ffmpeg_command(),
             '-i', stream_url,
@@ -308,8 +308,14 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
             segment_template
         ]
         
+        env = os.environ.copy()
+        if proxy_used:
+            env['http_proxy'] = proxy_used
+            env['https_proxy'] = proxy_used
+            logger.info(f"Using proxy for ffmpeg: {proxy_used}")
+        
         logger.info(f"Starting live recording: {' '.join(cmd)}")
-        process = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        process = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
         
         await update_status_msg(f"🔴 Recording live stream: {channel_name}\nSegments upload at 1.9GB.", force=True)
         
