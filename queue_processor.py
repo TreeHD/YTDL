@@ -316,6 +316,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
         uploaded_segments = set()
         
         while True:
+            # Check for immediate process death
             if process.returncode is not None:
                 break
                 
@@ -349,7 +350,11 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
             if process.returncode is not None:
                 break
                 
-        # Final upload
+        # Final upload (or error check if process died early)
+        if process.returncode != 0 and process.returncode is not None and not uploaded_segments:
+            await update_status_msg(f"❌ ffmpeg recording failed (Exit code: {process.returncode}). Possible geo-restriction or stream issue.", force=True)
+            return
+
         pattern = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_*.mp4")
         files = sorted(glob.glob(pattern))
         for f_path in files:
