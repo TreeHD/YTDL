@@ -153,6 +153,7 @@ async def process_queue(application, request_queue):
         try:
             status_msg_passed = None
             is_live = False
+            channel_name = None
             if len(task) == 7:
                 chat_id, url, message_id, max_height, status_msg_passed, channel_name, is_live = task
             elif len(task) == 6:
