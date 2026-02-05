@@ -46,6 +46,9 @@ def get_video_info(url):
             'quiet': True,
             'no_warnings': True,
             'extract_flat': False,
+            'socket_timeout': 10,
+            'retries': 2,
+            'nocheckcertificate': True,
         }
         if proxy:
             ydl_opts['proxy'] = proxy
@@ -88,6 +91,10 @@ def get_channel_info(channel_url):
             'no_warnings': True,
             'extract_flat': True,
             'playlist_items': '0',
+            'socket_timeout': 10,
+            'retries': 2,
+            'nocheckcertificate': True,
+            'no_color': True,
         }
         if proxy:
             ydl_opts['proxy'] = proxy
@@ -118,6 +125,10 @@ def get_latest_videos(channel_id, limit=5):
             'no_warnings': True,
             'extract_flat': True,
             'playlist_items': f'1-{limit}',
+            'socket_timeout': 10,
+            'retries': 2,
+            'nocheckcertificate': True,
+            'no_color': True,
         }
         if proxy:
             ydl_opts['proxy'] = proxy
@@ -176,6 +187,9 @@ def download_content(url, progress_callback=None, audio_only=False, max_height=1
                 'writethumbnail': True,
                 'overwrites': True,
                 'progress_hooks': [progress_adapter],
+                'socket_timeout': 30,
+                'retries': 3,
+                'nocheckcertificate': True,
             }
         else:
             ydl_opts = {
@@ -195,6 +209,9 @@ def download_content(url, progress_callback=None, audio_only=False, max_height=1
                     {'key': 'FFmpegThumbnailsConvertor', 'format': 'jpg', 'when': 'before_dl'},
                     {'key': 'FFmpegExtractAudio', 'nopostoverwrites': False} if audio_only else {'key': 'FFmpegMetadata'}
                 ],
+                'socket_timeout': 30,
+                'retries': 3,
+                'nocheckcertificate': True,
             }
         
         if proxy:
@@ -259,6 +276,10 @@ def get_playlist_info(url):
             'quiet': True,
             'no_warnings': True,
             'extract_flat': True,
+            'socket_timeout': 10,
+            'retries': 2,
+            'nocheckcertificate': True,
+            'no_color': True,
         }
         if proxy:
             ydl_opts['proxy'] = proxy
@@ -316,10 +337,12 @@ def get_live_info(channel_id):
             'quiet': True,
             'no_warnings': True,
             'extract_flat': False,
+            'socket_timeout': 10,
+            'retries': 1,
+            'nocheckcertificate': True,
         }
         if proxy:
             ydl_opts['proxy'] = proxy
-            
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(live_url, download=False)
@@ -342,6 +365,8 @@ def get_stream_url(url):
         ydl_opts = {
             'quiet': True,
             'format': 'best',
+            'socket_timeout': 15,
+            'nocheckcertificate': True,
         }
         if proxy:
             ydl_opts['proxy'] = proxy
