@@ -19,9 +19,9 @@ GEO_RESTRICTION_ERRORS = [
     'available in your country',
     'geo',
     'blocked',
-    'not available',
-    'Sign in to confirm your age',
     'This video is not available',
+    'content is not available',
+    'Sign in to confirm your age',
     'Private video',
     'removed by the uploader',
     'uploader has not made this video available',
@@ -194,7 +194,7 @@ def download_content(url, progress_callback=None, audio_only=False, max_height=1
         else:
             ydl_opts = {
                 'outtmpl': f'{DOWNLOAD_DIR}/%(title)s [%(id)s].%(ext)s',
-                'format': f'bestvideo[height<={max_height}]+bestaudio/best[height<={max_height}]',
+                'format': f'bestvideo[height<={max_height}]+bestaudio/best[height<={max_height}]/best',
                 'merge_output_format': 'mp4',
                 'noplaylist': True,
                 'quiet': True,
