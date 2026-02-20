@@ -159,15 +159,21 @@ def download_content(url, progress_callback=None, audio_only=False, max_height=1
     proxy_list = get_proxy_list()
     last_error = None
     
+    # Track actual downloaded filename from progress hook
+    actual_downloaded = [None]
+    
     def progress_adapter(d):
         if task_id and cancelled_tasks and task_id in cancelled_tasks:
             raise Exception("Download cancelled by user")
+        if d.get('status') == 'finished':
+            actual_downloaded[0] = d.get('filename')
         if progress_callback:
             progress_callback(d)
 
     for proxy_idx, proxy in enumerate(proxy_list):
         proxy_label = proxy if proxy else "Direct (no proxy)"
         logger.info(f"Attempting download with proxy [{proxy_idx+1}/{len(proxy_list)}]: {proxy_label}")
+        actual_downloaded[0] = None  # Reset for each proxy attempt
         
         if audio_only:
             ydl_opts = {
@@ -233,6 +239,26 @@ def download_content(url, progress_callback=None, audio_only=False, max_height=1
                             if os.path.exists(base + ext):
                                 filename = base + ext
                                 break
+                
+                # Fallback: if file doesn't exist (e.g. album URL where
+                # prepare_filename returns the album name instead of the
+                # actual track name), use the filename captured from
+                # the progress hook.
+                if not os.path.exists(filename) and actual_downloaded[0]:
+                    hook_base, _ = os.path.splitext(actual_downloaded[0])
+                    if audio_only:
+                        alt = hook_base + '.m4a'
+                    else:
+                        alt = None
+                        for ext in ['.mp4', '.mkv', '.webm']:
+                            if os.path.exists(hook_base + ext):
+                                alt = hook_base + ext
+                                break
+                        if not alt:
+                            alt = actual_downloaded[0]
+                    if os.path.exists(alt):
+                        logger.info(f"prepare_filename mismatch, using actual file: {alt}")
+                        filename = alt
                 
                 # Handle thumbnail path
                 thumb_path = None
