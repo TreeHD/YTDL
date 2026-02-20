@@ -4,7 +4,7 @@ FROM python:3.14.2-alpine3.23
 WORKDIR /app
 
 # Install system dependencies
-RUN apk update && apk add --no-cache ffmpeg
+RUN apk update && apk add --no-cache ffmpeg deno
 
 # Install python dependencies
 COPY requirements.txt .
