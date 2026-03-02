@@ -21,7 +21,7 @@ from downloader import (
     download_content, get_video_info, 
     get_channel_info, get_playlist_info, is_playlist
 )
-from uploader import upload_video_streaming, upload_audio_streaming, split_video
+from uploader import upload_video_streaming, upload_audio_streaming, split_video, crop_to_square
 
 logger = logging.getLogger(__name__)
 
@@ -485,7 +485,11 @@ async def audio_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             from queue_processor import tg_retry
             # Attempt to reply to the original user source message
             with open(file_path, 'rb') as f:
-                thumb = open(thumb_path, 'rb') if thumb_path and os.path.exists(thumb_path) else None
+                if thumb_path and os.path.exists(thumb_path):
+                    thumb_path = crop_to_square(thumb_path)
+                    thumb = open(thumb_path, 'rb')
+                else:
+                    thumb = None
                 await tg_retry(context.bot.send_audio, chat_id=chat_id, audio=f, title=title, caption=full_caption, reply_to_message_id=reply_id, thumbnail=thumb)
                 if thumb: thumb.close()
         

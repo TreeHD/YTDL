@@ -3,3 +3,4 @@ python-telegram-bot
 aiohttp
 aiofiles
 pytest
+Pillow

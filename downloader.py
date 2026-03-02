@@ -177,7 +177,7 @@ def download_content(url, progress_callback=None, audio_only=False, max_height=1
         
         if audio_only:
             ydl_opts = {
-                'outtmpl': f'{DOWNLOAD_DIR}/%(title)s [%(id)s].%(ext)s',
+                'outtmpl': f'{DOWNLOAD_DIR}/%(title).80s [%(id)s].%(ext)s',
                 'format': 'bestaudio/best',
                 'postprocessors': [
                     {
@@ -199,7 +199,7 @@ def download_content(url, progress_callback=None, audio_only=False, max_height=1
             }
         else:
             ydl_opts = {
-                'outtmpl': f'{DOWNLOAD_DIR}/%(title)s [%(id)s].%(ext)s',
+                'outtmpl': f'{DOWNLOAD_DIR}/%(title).80s [%(id)s].%(ext)s',
                 'format': f'bestvideo[height<={max_height}]+bestaudio/best[height<={max_height}]/best',
                 'merge_output_format': 'mp4',
                 'noplaylist': True,

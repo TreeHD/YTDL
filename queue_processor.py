@@ -11,7 +11,7 @@ from telegram.error import RetryAfter, TelegramError
 
 from config import load_config, check_disk_space, check_ffmpeg, DOWNLOAD_DIR, get_ffmpeg_command
 from downloader import download_content, get_video_info, get_playlist_info, get_stream_url
-from uploader import upload_video_streaming, upload_audio_streaming, split_video
+from uploader import upload_video_streaming, upload_audio_streaming, split_video, crop_to_square
 from handlers import cancelled_tasks
 
 logger = logging.getLogger(__name__)
@@ -59,7 +59,11 @@ async def handle_upload(application, chat_id, file_path, title, url, audio_only=
                 await upload_audio_streaming(bot_token, api_url, chat_id, file_path, title, full_caption, reply_to_message_id=reply_to_message_id, thumb_path=thumb_path)
             else:
                 with open(file_path, 'rb') as f:
-                    thumb = open(thumb_path, 'rb') if thumb_path and os.path.exists(thumb_path) else None
+                    if thumb_path and os.path.exists(thumb_path):
+                        thumb_path = crop_to_square(thumb_path)
+                        thumb = open(thumb_path, 'rb')
+                    else:
+                        thumb = None
                     await tg_retry(application.bot.send_audio, chat_id=chat_id, audio=f, title=title, caption=full_caption, reply_to_message_id=reply_to_message_id, thumbnail=thumb)
                     if thumb: thumb.close()
             
@@ -109,7 +113,12 @@ async def handle_upload(application, chat_id, file_path, title, url, audio_only=
                         reply_markup = InlineKeyboardMarkup(keyboard)
                         
                         with open(f_path, 'rb') as f:
-                            thumb = open(thumb_path, 'rb') if thumb_path and os.path.exists(thumb_path) else None
+                            if thumb_path and os.path.exists(thumb_path):
+                                thumb_path = crop_to_square(thumb_path)
+                                thumb = open(thumb_path, 'rb')
+                            else:
+                                thumb = None
+                            
                             await tg_retry(application.bot.send_video,
                                 chat_id=chat_id, video=f, caption=caption, 
                                 supports_streaming=True, reply_markup=reply_markup,

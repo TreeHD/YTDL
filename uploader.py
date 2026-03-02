@@ -11,8 +11,36 @@ import aiohttp
 import aiofiles
 
 from config import load_config, LOCAL_API_LIMIT, get_ffmpeg_command, check_ffmpeg
+from PIL import Image
 
 logger = logging.getLogger(__name__)
+
+def crop_to_square(image_path):
+    """Crop an image to a 1:1 square ratio centered for Telegram thumbnails."""
+    try:
+        with Image.open(image_path) as img:
+            width, height = img.size
+            if width == height:
+                return image_path
+            
+            # Calculate coordinates for center cropping
+            new_size = min(width, height)
+            left = (width - new_size) / 2
+            top = (height - new_size) / 2
+            right = (width + new_size) / 2
+            bottom = (height + new_size) / 2
+            
+            # Crop and save back
+            img_cropped = img.crop((left, top, right, bottom))
+            # Convert to RGB if needed (e.g. from RGBA/WebP)
+            if img_cropped.mode != 'RGB':
+                img_cropped = img_cropped.convert('RGB')
+            img_cropped.save(image_path, 'JPEG')
+            logger.info(f"Cropped thumbnail to square: {image_path}")
+            return image_path
+    except Exception as e:
+        logger.warning(f"Failed to crop thumbnail {image_path}: {e}")
+        return image_path
 
 # --- Video Splitting ---
 def split_video(file_path, max_size_bytes=None):
@@ -109,6 +137,7 @@ async def upload_video_streaming(bot_token, api_url, chat_id, file_path, caption
             part.set_content_disposition('form-data', name='reply_to_message_id')
         
         if thumb_path and os.path.exists(thumb_path):
+            thumb_path = crop_to_square(thumb_path)
             thumb_part = mpwriter.append(open(thumb_path, 'rb'))
             # Note: Telegram usually uses 'thumbnail' or 'thumb'
             thumb_part.set_content_disposition('form-data', name='thumbnail', filename=os.path.basename(thumb_path))
@@ -157,6 +186,7 @@ async def upload_audio_streaming(bot_token, api_url, chat_id, file_path, title="
             part.set_content_disposition('form-data', name='reply_to_message_id')
             
         if thumb_path and os.path.exists(thumb_path):
+            thumb_path = crop_to_square(thumb_path)
             thumb_part = mpwriter.append(open(thumb_path, 'rb'))
             thumb_part.set_content_disposition('form-data', name='thumbnail', filename=os.path.basename(thumb_path))
             thumb_part.headers['Content-Type'] = 'image/jpeg'
