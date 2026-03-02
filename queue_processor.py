@@ -399,6 +399,8 @@ async def process_playlist_queue(application, playlist_queue):
             task_id = f"pl_{chat_id}_{int(time.time())}"
             status_msg = status_msg_passed
             
+            audio_only = (max_height == -1)
+            
             last_edit_time = 0
             async def update_status_msg(text, force=True, show_cancel=True):
                 nonlocal status_msg, last_edit_time
@@ -437,7 +439,8 @@ async def process_playlist_queue(application, playlist_queue):
                     await update_status_msg("❌ No videos found in playlist.")
                     continue
                 
-                await update_status_msg(f"📋 Playlist: {playlist_title}\n🎬 Found {total_videos} videos.\n🚀 Starting sequential process...")
+                mode_str = "Audio M4A" if audio_only else f"{max_height}p"
+                await update_status_msg(f"📋 Playlist: {playlist_title}\n🎬 Found {total_videos} videos.\n🚀 Starting sequential process ({mode_str})...")
                 
                 for i, entry in enumerate(entries):
                     if task_id in cancelled_tasks:
@@ -454,18 +457,19 @@ async def process_playlist_queue(application, playlist_queue):
                         if task_id in cancelled_tasks: raise Exception("Cancelled")
                         if d['status'] == 'downloading':
                             p = d.get('_percent_str', '0%')
-                            asyncio.run_coroutine_threadsafe(update_status_msg(f"📋 Playlist: {i+1}/{total_videos}\n⬇️ Video: {p}", force=False), loop)
+                            asyncio.run_coroutine_threadsafe(update_status_msg(f"📋 Playlist: {i+1}/{total_videos}\n⬇️ {mode_str}: {p}", force=False), loop)
 
                     try:
                         file_path, title, video_id, thumb_path = await loop.run_in_executor(
                             None,
-                            lambda: download_content(v_url, progress_cb, audio_only=False, max_height=max_height, task_id=task_id, cancelled_tasks=cancelled_tasks)
+                            lambda: download_content(v_url, progress_cb, audio_only=audio_only, max_height=max_height, task_id=task_id, cancelled_tasks=cancelled_tasks)
                         )
-                        await handle_upload(application, chat_id, file_path, f"{playlist_title}\n{title}", v_url, False, update_status_msg, reply_to_message_id=message_id, thumb_path=thumb_path)
+                        await handle_upload(application, chat_id, file_path, f"{playlist_title}\n{title}", v_url, audio_only, update_status_msg, reply_to_message_id=message_id, thumb_path=thumb_path)
                     except Exception as e:
                         logger.error(f"Failed for video {i+1}: {e}")
                         await application.bot.send_message(chat_id=chat_id, text=f"⚠️ Skipped {v_title[:30]}: {e}")
                         continue
+
                 
                 await update_status_msg(f"✨ Playlist complete! Finished {total_videos} videos.")
 

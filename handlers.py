@@ -79,10 +79,24 @@ async def handle_music_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await context.bot.send_message(chat_id=chat_id, text="Please send a valid URL.", reply_to_message_id=message_id)
         return
     
-    status_msg = await context.bot.send_message(chat_id=chat_id, text="🎵 Adding to queue (Audio M4A)...", reply_to_message_id=message_id)
-    await request_queue.put((chat_id, url, message_id, -1, status_msg))
-    q_size = request_queue.qsize()
-    await status_msg.edit_text(f"🎵 Added to queue (Audio M4A). Queue Depth: {q_size}")
+    status_msg = await context.bot.send_message(chat_id=chat_id, text="🔍 Analyzing URL...", reply_to_message_id=message_id)
+    
+    loop = asyncio.get_running_loop()
+    is_pl = await loop.run_in_executor(None, is_playlist, url)
+    
+    if is_pl:
+        await status_msg.edit_text("📋 Audio Playlist detected. Adding to queue...")
+        playlist_queue = context.application.bot_data.get('playlist_queue')
+        if playlist_queue:
+            await playlist_queue.put((chat_id, url, message_id, -1, status_msg))
+            await status_msg.edit_text("📋 Audio Playlist added to queue. Sequential processing started...")
+        else:
+            await status_msg.edit_text("❌ Error getting playlist queue.")
+    else:
+        await status_msg.edit_text("🎵 Adding to queue (Audio M4A)...")
+        await request_queue.put((chat_id, url, message_id, -1, status_msg))
+        q_size = request_queue.qsize()
+        await status_msg.edit_text(f"🎵 Added to queue (Audio M4A). Queue Depth: {q_size}")
 
 async def handle_quality_command(update: Update, context: ContextTypes.DEFAULT_TYPE, request_queue):
     """Handle quality-specific download commands like /720, /480, /240."""
@@ -181,9 +195,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE, req
     res = settings.get('resolution', 1080)
     
     if is_pl:
-        await status_msg.edit_text(f"📋 Playlist detected. Adding to queue ({res}p)...")
-        await context.application.bot_data['playlist_queue'].put((chat_id, url, message_id, res, status_msg))
-        await status_msg.edit_text(f"📋 Playlist added to queue ({res}p).")
+        final_res = -1 if mode == 'audio' else res
+        mode_str = "Audio M4A" if mode == 'audio' else f"{res}p"
+        await status_msg.edit_text(f"📋 Playlist detected. Adding to queue ({mode_str})...")
+        await context.application.bot_data['playlist_queue'].put((chat_id, url, message_id, final_res, status_msg))
+        await status_msg.edit_text(f"📋 Playlist added to queue ({mode_str}).")
     else:
         # If mode is audio, set resolution to -1 (marker for audio in our processor)
         final_res = -1 if mode == 'audio' else res
