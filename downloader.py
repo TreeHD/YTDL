@@ -11,7 +11,11 @@ from config import DOWNLOAD_DIR, get_proxy_list, load_config, get_ffmpeg_command
 
 logger = logging.getLogger(__name__)
 
-# --- Geo-restriction Detection ---
+import urllib.request
+import urllib.error
+import time
+
+# --- Geo-restriction & Bot Detection ---
 GEO_RESTRICTION_ERRORS = [
     'Video unavailable',
     'is not available in your country',
@@ -26,14 +30,34 @@ GEO_RESTRICTION_ERRORS = [
     'removed by the uploader',
     'uploader has not made this video available',
     'country',
+    'bot',
+    'cookies are required',
+    'Sign in to confirm you\'re not a bot',
 ]
 
-def is_geo_restricted_error(error_msg):
-    """Check if error is geo-restriction related."""
+def restart_warp_proxy():
+    """Trigger the WARP proxy to rotate its IP."""
+    logger.info("Attempting to rotate WARP IP via warp-proxy:9090...")
+    try:
+        req = urllib.request.Request("http://warp-proxy:9090/restart")
+        with urllib.request.urlopen(req, timeout=5) as response:
+            if response.status == 200:
+                logger.info("WARP IP rotation triggered successfully. Waiting 10s for reconnect...")
+                time.sleep(10)
+                return True
+    except Exception as e:
+        logger.warning(f"Failed to trigger WARP restart: {e}")
+    return False
+
+def is_geo_restricted_error(error_msg, proxy_url=None):
+    """Check if error is geo-restriction related and rotate WARP if needed."""
     error_lower = str(error_msg).lower()
     matched = any(pattern.lower() in error_lower for pattern in GEO_RESTRICTION_ERRORS)
     if matched:
-        logger.info(f"Geo-restriction pattern matched in error: {error_msg[:100]}")
+        logger.info(f"Geo-restriction or Bot pattern matched in error: {error_msg[:100]}")
+        # If the failed proxy was our warp container, try rotating the IP on the fly
+        if proxy_url and 'warp-proxy' in proxy_url:
+            restart_warp_proxy()
     return matched
 
 # --- Video Info Extraction ---
@@ -146,7 +170,7 @@ def get_latest_videos(channel_id, limit=5):
                         })
                 return videos
         except Exception as e:
-            if is_geo_restricted_error(str(e)):
+            if is_geo_restricted_error(str(e), proxy):
                 continue
             logger.warning(f"Failed to get latest videos: {e}")
             return []
@@ -269,20 +293,19 @@ def download_content(url, progress_callback=None, audio_only=False, max_height=1
                     if os.path.exists(potential_thumb):
                         thumb_path = potential_thumb
                         break
-                
                 logger.info(f"Download successful: {filename} (Thumb: {thumb_path})")
                 return filename, info.get('title', 'video'), info.get('id', ''), thumb_path
                 
         except Exception as e:
-            last_error = e
-            error_msg = str(e)
-            logger.warning(f"Download failed with proxy {proxy_label}: {error_msg}")
+            last_error = str(e)
             
-            if is_geo_restricted_error(error_msg):
-                logger.info(f"Geo-restriction detected. Trying next proxy...")
+            if is_geo_restricted_error(last_error, proxy):
+                # If geo-restricted or bot detected, try next proxy
+                if progress_callback:
+                    progress_callback({'status': 'geo_err', 'msg': f'Blocked by YouTube using proxy {proxy or "Direct"}. Trying next.'})
                 continue
             else:
-                logger.error(f"Non-geo error, stopping retry: {error_msg}")
+                logger.error(f"Non-geo error, stopping retry: {last_error}")
                 raise e
     
     if len(proxy_list) == 1 and proxy_list[0] is None:
@@ -322,7 +345,7 @@ def get_playlist_info(url):
                     'entries': [{'url': e.get('url') or f"https://www.youtube.com/watch?v={e.get('id')}", 'title': e.get('title', 'Unknown')} for e in entries if e]
                 }
         except Exception as e:
-            if is_geo_restricted_error(str(e)):
+            if is_geo_restricted_error(str(e), proxy):
                 continue
             raise e
     
@@ -348,7 +371,7 @@ def is_playlist(url):
                 # ie_key is usually present for nested items, we want the top level to be a playlist
                 return 'entries' in info and bool(info.get('entries'))
         except Exception as e:
-            if is_geo_restricted_error(str(e)):
+            if is_geo_restricted_error(str(e), proxy):
                 continue
             return False
     return False

@@ -22,3 +22,15 @@ services:
       - ./downloads:/app/downloads
     ports:
       - "8081:8081"
+
+  warp-proxy:
+    image: treexhd/warp-proxy:latest
+    container_name: warp-proxy
+    restart: unless-stopped
+    environment:
+      - WARP_SOCKS_PORT=${WARP_SOCKS_PORT:-1080}
+      - WARP_USERNAME=${WARP_USERNAME:-warpuser}
+      - WARP_PASSWORD=${WARP_PASSWORD:-warppass}
+    # Web UI / HTTP Trigger listener port for IP Rotation
+    # Not exposed externally to protect it
+    # Accessible internally at http://warp-proxy:9090
