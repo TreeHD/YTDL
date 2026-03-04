@@ -2,10 +2,8 @@ FROM golang:1.21-alpine AS builder
 
 RUN apk add --no-cache git make
 
-# Build wireproxy from source
-RUN git clone https://github.com/pufferffish/wireproxy.git /wireproxy
-WORKDIR /wireproxy
-RUN make
+# Build wireproxy using go install
+RUN go install github.com/pufferffish/wireproxy/cmd/wireproxy@latest
 
 FROM alpine:latest
 
@@ -15,7 +13,7 @@ RUN apk add --no-cache netcat-openbsd tzdata ca-certificates bash dos2unix curl
 WORKDIR /app
 
 # Copy binaries from builder
-COPY --from=builder /wireproxy/wireproxy /usr/bin/wireproxy
+COPY --from=builder /go/bin/wireproxy /usr/bin/wireproxy
 
 # Use external P3TERX script to fetch precompiled wgcf
 RUN curl -fsSL https://raw.githubusercontent.com/P3TERX/script/master/wgcf.sh | bash
