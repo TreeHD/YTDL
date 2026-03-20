@@ -3,7 +3,7 @@ FROM golang:1.21-alpine AS builder
 RUN apk add --no-cache git make
 
 # Build wireproxy using go install
-RUN go install github.com/pufferffish/wireproxy/cmd/wireproxy@latest
+RUN go install github.com/windtf/wireproxy/cmd/wireproxy@latest
 
 FROM alpine:latest
 
