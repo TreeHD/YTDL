@@ -112,9 +112,14 @@ Or use quality-specific commands:
 
 ### Audio Download
 
-Use the `/music` command to download audio only (M4A format):
+Use the `/music` command to download audio (M4A format):
 ```
 /music https://www.youtube.com/watch?v=dQw4w9WgXcQ
+```
+
+Use the `/mp3` command to download audio (MP3 format):
+```
+/mp3 https://www.youtube.com/watch?v=dQw4w9WgXcQ
 ```
 
 Or click the "🎵 Download Audio" button after a video is uploaded.

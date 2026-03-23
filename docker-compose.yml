@@ -1,6 +1,6 @@
 services:
   ytdl-bot:
-    image: treexhd/ytdl-bot:latest
+    image: ghcr.io/treehd/ytdl:latest
     container_name: ytdl-bot
     restart: unless-stopped
     volumes:
@@ -24,7 +24,7 @@ services:
       - "8081:8081"
 
   warp-proxy:
-    image: treexhd/warp-proxy:latest
+    image: ghcr.io/treehd/ytdl-warp-proxy:latest
     container_name: warp-proxy
     restart: unless-stopped
     environment:

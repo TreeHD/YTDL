@@ -175,7 +175,8 @@ async def process_queue(application, request_queue):
                 chat_id, url, message_id = task
                 max_height = 1080
             
-            audio_only = (max_height == -1)
+            audio_only = (max_height in (-1, -2))
+            audio_format = 'mp3' if max_height == -2 else 'm4a'
             if audio_only:
                 max_height = 1080
             
@@ -257,14 +258,14 @@ async def process_queue(application, request_queue):
                 if d['status'] == 'downloading':
                     p = d.get('_percent_str', '0%')
                     eta = d.get('_eta_str', '?')
-                    mode = "🎵 Audio" if audio_only else f"{max_height}p"
+                    mode = f"🎵 Audio {audio_format.upper()}" if audio_only else f"{max_height}p"
                     asyncio.run_coroutine_threadsafe(update_status_msg(f"⬇️ Downloading ({mode}): {p}\nETA: {eta}", show_cancel=True), loop)
 
             # Download
             try:
                 file_path, title, video_id, thumb_path = await loop.run_in_executor(
                     None, 
-                    lambda: download_content(url, progress_cb, audio_only=audio_only, max_height=max_height, task_id=task_id, cancelled_tasks=cancelled_tasks)
+                    lambda: download_content(url, progress_cb, audio_only=audio_only, audio_format=audio_format, max_height=max_height, task_id=task_id, cancelled_tasks=cancelled_tasks)
                 )
                 # Upload using helper
                 await handle_upload(application, chat_id, file_path, title, url, audio_only, update_status_msg, channel_name, message_id, thumb_path)
@@ -408,7 +409,8 @@ async def process_playlist_queue(application, playlist_queue):
             task_id = f"pl_{chat_id}_{int(time.time())}"
             status_msg = status_msg_passed
             
-            audio_only = (max_height == -1)
+            audio_only = (max_height in (-1, -2))
+            audio_format = 'mp3' if max_height == -2 else 'm4a'
             
             last_edit_time = 0
             async def update_status_msg(text, force=True, show_cancel=True):
@@ -448,7 +450,7 @@ async def process_playlist_queue(application, playlist_queue):
                     await update_status_msg("❌ No videos found in playlist.")
                     continue
                 
-                mode_str = "Audio M4A" if audio_only else f"{max_height}p"
+                mode_str = f"Audio {audio_format.upper()}" if audio_only else f"{max_height}p"
                 await update_status_msg(f"📋 Playlist: {playlist_title}\n🎬 Found {total_videos} videos.\n🚀 Starting sequential process ({mode_str})...")
                 
                 for i, entry in enumerate(entries):
@@ -471,7 +473,7 @@ async def process_playlist_queue(application, playlist_queue):
                     try:
                         file_path, title, video_id, thumb_path = await loop.run_in_executor(
                             None,
-                            lambda: download_content(v_url, progress_cb, audio_only=audio_only, max_height=max_height, task_id=task_id, cancelled_tasks=cancelled_tasks)
+                            lambda: download_content(v_url, progress_cb, audio_only=audio_only, audio_format=audio_format, max_height=max_height, task_id=task_id, cancelled_tasks=cancelled_tasks)
                         )
                         await handle_upload(application, chat_id, file_path, f"{playlist_title}\n{title}", v_url, audio_only, update_status_msg, reply_to_message_id=message_id, thumb_path=thumb_path)
                     except Exception as e:

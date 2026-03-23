@@ -16,7 +16,7 @@ from telegram.ext import (
 from config import load_config, DOWNLOAD_DIR, check_ffmpeg, clear_downloads
 from database import init_db
 from handlers import (
-    start, handle_music_command, handle_quality_command,
+    start, handle_music_command, handle_mp3_command, handle_quality_command,
     handle_playlist_command, handle_message, 
     handle_subscribe_video, handle_subscribe_live,
     handle_unsubscribe, handle_subscriptions, cancel_callback, audio_callback,
@@ -85,6 +85,12 @@ def main():
     application.add_handler(CommandHandler(
         'music', 
         lambda update, context: handle_music_command(update, context, request_queue)
+    ))
+    
+    # MP3 command
+    application.add_handler(CommandHandler(
+        'mp3',
+        lambda update, context: handle_mp3_command(update, context, request_queue)
     ))
     
     # Playlist command

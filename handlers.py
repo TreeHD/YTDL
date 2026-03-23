@@ -98,6 +98,43 @@ async def handle_music_command(update: Update, context: ContextTypes.DEFAULT_TYP
         q_size = request_queue.qsize()
         await status_msg.edit_text(f"🎵 Added to queue (Audio M4A). Queue Depth: {q_size}")
 
+async def handle_mp3_command(update: Update, context: ContextTypes.DEFAULT_TYPE, request_queue):
+    """Handle /mp3 command for MP3 audio downloads."""
+    chat_id = update.effective_chat.id
+    message_id = update.message.message_id
+    
+    if not is_user_allowed(chat_id):
+        await context.bot.send_message(chat_id=chat_id, text="Sorry, you are not authorized.", reply_to_message_id=message_id)
+        return
+    
+    if not context.args:
+        await context.bot.send_message(chat_id=chat_id, text="Usage: `/mp3 <URL>`", reply_to_message_id=message_id, parse_mode='Markdown')
+        return
+    
+    url = context.args[0]
+    if not url.startswith(('http://', 'https://')):
+        await context.bot.send_message(chat_id=chat_id, text="Please send a valid URL.", reply_to_message_id=message_id)
+        return
+    
+    status_msg = await context.bot.send_message(chat_id=chat_id, text="🔍 Analyzing URL...", reply_to_message_id=message_id)
+    
+    loop = asyncio.get_running_loop()
+    is_pl = await loop.run_in_executor(None, is_playlist, url)
+    
+    if is_pl:
+        await status_msg.edit_text("📋 Audio Playlist detected. Adding to queue...")
+        playlist_queue = context.application.bot_data.get('playlist_queue')
+        if playlist_queue:
+            await playlist_queue.put((chat_id, url, message_id, -2, status_msg))
+            await status_msg.edit_text("📋 Audio Playlist added to queue. Sequential processing started...")
+        else:
+            await status_msg.edit_text("❌ Error getting playlist queue.")
+    else:
+        await status_msg.edit_text("🎵 Adding to queue (Audio MP3)...")
+        await request_queue.put((chat_id, url, message_id, -2, status_msg))
+        q_size = request_queue.qsize()
+        await status_msg.edit_text(f"🎵 Added to queue (Audio MP3). Queue Depth: {q_size}")
+
 async def handle_quality_command(update: Update, context: ContextTypes.DEFAULT_TYPE, request_queue):
     """Handle quality-specific download commands like /720, /480, /240."""
     chat_id = update.effective_chat.id

@@ -178,7 +178,7 @@ def get_latest_videos(channel_id, limit=5):
     return []
 
 # --- Main Download Function ---
-def download_content(url, progress_callback=None, audio_only=False, max_height=1080, task_id=None, cancelled_tasks=None):
+def download_content(url, progress_callback=None, audio_only=False, audio_format='m4a', max_height=1080, task_id=None, cancelled_tasks=None):
     """Download content with proxy rotation on geo-restriction errors."""
     proxy_list = get_proxy_list()
     last_error = None
@@ -206,7 +206,7 @@ def download_content(url, progress_callback=None, audio_only=False, max_height=1
                 'postprocessors': [
                     {
                         'key': 'FFmpegExtractAudio',
-                        'preferredcodec': 'm4a',
+                        'preferredcodec': audio_format,
                         'preferredquality': '192',
                     },
                     {'key': 'FFmpegThumbnailsConvertor', 'format': 'jpg', 'when': 'before_dl'},
@@ -255,7 +255,7 @@ def download_content(url, progress_callback=None, audio_only=False, max_height=1
                 # Handle audio extension
                 if audio_only:
                     base, _ = os.path.splitext(filename)
-                    filename = base + '.m4a'
+                    filename = base + f'.{audio_format}'
                 else:
                     if not os.path.exists(filename):
                         base, _ = os.path.splitext(filename)
@@ -271,7 +271,7 @@ def download_content(url, progress_callback=None, audio_only=False, max_height=1
                 if not os.path.exists(filename) and actual_downloaded[0]:
                     hook_base, _ = os.path.splitext(actual_downloaded[0])
                     if audio_only:
-                        alt = hook_base + '.m4a'
+                        alt = hook_base + f'.{audio_format}'
                     else:
                         alt = None
                         for ext in ['.mp4', '.mkv', '.webm']:
