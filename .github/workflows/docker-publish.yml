@@ -11,8 +11,6 @@ on:
 env:
   # Use GHCR for GitHub Packages
   REGISTRY: ghcr.io
-  # github.repository as <account>/<repo>
-  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   build:
@@ -52,6 +50,10 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Convert github.repository to lowercase to satisfy Docker naming constraints
+      - name: Set lowercased IMAGE_NAME
+        run: echo "IMAGE_NAME=$(echo ${{ github.repository }} | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
 
       # Extract metadata (tags, labels)
       - name: Extract Docker metadata
@@ -125,6 +127,9 @@ jobs:
           path: /tmp/digests
           pattern: digests-${{ matrix.target.name }}-*
           merge-multiple: true
+
+      - name: Set lowercased IMAGE_NAME
+        run: echo "IMAGE_NAME=$(echo ${{ github.repository }} | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
