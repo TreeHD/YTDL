@@ -413,7 +413,7 @@ async def process_playlist_queue(application, playlist_queue):
             audio_format = 'mp3' if max_height == -2 else 'm4a'
             
             last_edit_time = 0
-            async def update_status_msg(text, force=True, show_cancel=True):
+            async def update_status_msg(text, force=True, show_cancel=True, send_new=False):
                 nonlocal status_msg, last_edit_time
                 now = time.time()
                 if not force and (now - last_edit_time < 20):
@@ -424,6 +424,13 @@ async def process_playlist_queue(application, playlist_queue):
                         keyboard = [[InlineKeyboardButton("❌ Cancel Playlist", callback_data=f"cancel:{task_id}")]]
                         reply_markup = InlineKeyboardMarkup(keyboard)
                         
+                    if send_new and status_msg:
+                        try:
+                            await tg_retry(status_msg.delete)
+                        except Exception as e:
+                            logger.warning(f"Failed to delete old status msg: {e}")
+                        status_msg = None
+
                     if status_msg:
                         if status_msg.text != text:
                             await tg_retry(status_msg.edit_text, text, reply_markup=reply_markup)
@@ -462,7 +469,7 @@ async def process_playlist_queue(application, playlist_queue):
                     v_url = entry['url']
                     v_title = entry['title']
                     
-                    await update_status_msg(f"🔄 Processing {i+1}/{total_videos}: {v_title[:30]}...")
+                    await update_status_msg(f"🔄 Processing {i+1}/{total_videos}: {v_title[:30]}...", send_new=True)
                     
                     def progress_cb(d):
                         if task_id in cancelled_tasks: raise Exception("Cancelled")
@@ -482,7 +489,7 @@ async def process_playlist_queue(application, playlist_queue):
                         continue
 
                 
-                await update_status_msg(f"✨ Playlist complete! Finished {total_videos} videos.")
+                await update_status_msg(f"✨ Playlist complete! Finished {total_videos} videos.", send_new=True)
 
             except asyncio.TimeoutError:
                 await update_status_msg("❌ Timeout getting playlist info.")

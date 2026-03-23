@@ -73,6 +73,7 @@ def get_video_info(url):
             'socket_timeout': 10,
             'retries': 2,
             'nocheckcertificate': True,
+            'remote_components': 'ejs:github',
         }
         if proxy:
             ydl_opts['proxy'] = proxy
@@ -118,6 +119,7 @@ def get_channel_info(channel_url):
             'socket_timeout': 10,
             'retries': 2,
             'nocheckcertificate': True,
+            'remote_components': 'ejs:github',
             'no_color': True,
         }
         if proxy:
@@ -152,6 +154,7 @@ def get_latest_videos(channel_id, limit=5):
             'socket_timeout': 10,
             'retries': 2,
             'nocheckcertificate': True,
+            'remote_components': 'ejs:github',
             'no_color': True,
         }
         if proxy:
@@ -220,6 +223,7 @@ def download_content(url, progress_callback=None, audio_only=False, audio_format
                 'socket_timeout': 30,
                 'retries': 3,
                 'nocheckcertificate': True,
+                'remote_components': 'ejs:github',
             }
         else:
             ydl_opts = {
@@ -242,6 +246,7 @@ def download_content(url, progress_callback=None, audio_only=False, audio_format
                 'socket_timeout': 30,
                 'retries': 3,
                 'nocheckcertificate': True,
+                'remote_components': 'ejs:github',
             }
         
         if proxy:
@@ -328,6 +333,7 @@ def get_playlist_info(url):
             'socket_timeout': 10,
             'retries': 2,
             'nocheckcertificate': True,
+            'remote_components': 'ejs:github',
             'no_color': True,
         }
         if proxy:
@@ -389,6 +395,7 @@ def get_live_info(channel_id):
             'socket_timeout': 10,
             'retries': 1,
             'nocheckcertificate': True,
+            'remote_components': 'ejs:github',
         }
         if proxy:
             ydl_opts['proxy'] = proxy
@@ -416,6 +423,7 @@ def get_stream_url(url):
             'format': 'best',
             'socket_timeout': 15,
             'nocheckcertificate': True,
+            'remote_components': 'ejs:github',
         }
         if proxy:
             ydl_opts['proxy'] = proxy
