@@ -482,7 +482,7 @@ async def process_playlist_queue(application, playlist_queue):
                             None,
                             lambda: download_content(v_url, progress_cb, audio_only=audio_only, audio_format=audio_format, max_height=max_height, task_id=task_id, cancelled_tasks=cancelled_tasks)
                         )
-                        await handle_upload(application, chat_id, file_path, f"{playlist_title}\n{title}", v_url, audio_only, update_status_msg, reply_to_message_id=message_id, thumb_path=thumb_path)
+                        await handle_upload(application, chat_id, file_path, title, v_url, audio_only, update_status_func=update_status_msg, reply_to_message_id=message_id, thumb_path=thumb_path)
                     except Exception as e:
                         logger.error(f"Failed for video {i+1}: {e}")
                         await application.bot.send_message(chat_id=chat_id, text=f"⚠️ Skipped {v_title[:30]}: {e}")
