@@ -7,7 +7,7 @@ import os
 import logging
 import yt_dlp
 
-from config import DOWNLOAD_DIR, get_proxy_list, load_config, get_ffmpeg_command
+from config import DOWNLOAD_DIR, get_proxy_list, load_config, get_ffmpeg_command, get_cookie_file
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +60,13 @@ def is_geo_restricted_error(error_msg, proxy_url=None):
             restart_warp_proxy()
     return matched
 
+def _apply_cookie(ydl_opts):
+    """Inject cookiefile into ydl_opts if a cookie jar is present."""
+    cookie_file = get_cookie_file()
+    if cookie_file:
+        ydl_opts['cookiefile'] = cookie_file
+    return ydl_opts
+
 # --- Video Info Extraction ---
 def get_video_info(url):
     """Extract video info without downloading to check file size."""
@@ -77,7 +84,8 @@ def get_video_info(url):
         }
         if proxy:
             ydl_opts['proxy'] = proxy
-        
+        _apply_cookie(ydl_opts)
+
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
@@ -124,7 +132,8 @@ def get_channel_info(channel_url):
         }
         if proxy:
             ydl_opts['proxy'] = proxy
-        
+        _apply_cookie(ydl_opts)
+
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(channel_url, download=False)
@@ -159,7 +168,8 @@ def get_latest_videos(channel_id, limit=5):
         }
         if proxy:
             ydl_opts['proxy'] = proxy
-        
+        _apply_cookie(ydl_opts)
+
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(channel_url, download=False)
@@ -251,7 +261,8 @@ def download_content(url, progress_callback=None, audio_only=False, audio_format
         
         if proxy:
             ydl_opts['proxy'] = proxy
-        
+        _apply_cookie(ydl_opts)
+
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
@@ -338,7 +349,8 @@ def get_playlist_info(url):
         }
         if proxy:
             ydl_opts['proxy'] = proxy
-        
+        _apply_cookie(ydl_opts)
+
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
@@ -369,7 +381,8 @@ def is_playlist(url):
         }
         if proxy:
             ydl_opts['proxy'] = proxy
-        
+        _apply_cookie(ydl_opts)
+
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
@@ -399,6 +412,7 @@ def get_live_info(channel_id):
         }
         if proxy:
             ydl_opts['proxy'] = proxy
+        _apply_cookie(ydl_opts)
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(live_url, download=False)
@@ -427,6 +441,7 @@ def get_stream_url(url):
         }
         if proxy:
             ydl_opts['proxy'] = proxy
+        _apply_cookie(ydl_opts)
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)

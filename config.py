@@ -12,6 +12,11 @@ logger = logging.getLogger(__name__)
 # Directories
 DOWNLOAD_DIR = './downloads'
 
+# Optional Netscape-format cookie jar (yt-dlp compatible). Drop a file here to
+# bypass YouTube 403 / bot checks. Lives under ./data so the existing volume
+# mount in docker-compose.yml exposes it without extra config.
+COOKIE_FILE = './data/cookies.txt'
+
 # Telegram file size limits
 STANDARD_API_LIMIT = 50 * 1024 * 1024 - 1024 * 1024  # 49MB
 LOCAL_API_LIMIT = 2000 * 1024 * 1024 - 1024 * 1024 * 50  # ~1.95GB
@@ -42,6 +47,12 @@ def check_ffmpeg():
         return result.returncode == 0
     except:
         return False
+
+def get_cookie_file():
+    """Return the cookie jar path if a yt-dlp compatible file exists, else None."""
+    if os.path.isfile(COOKIE_FILE) and os.path.getsize(COOKIE_FILE) > 0:
+        return COOKIE_FILE
+    return None
 
 def get_proxy_list():
     """Get list of proxies for rotation."""

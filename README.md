@@ -270,6 +270,11 @@ docker-compose logs -f ytdl-bot
 - Add proxies to `PROXY_LIST`
 - Use VPN on your server
 
+### YouTube 403 / "Sign in to confirm you're not a bot"
+- Export your YouTube cookies in **Netscape format** (use the `Get cookies.txt LOCALLY` browser extension or `yt-dlp --cookies-from-browser`).
+- Drop the file at `./data/cookies.txt` — the existing `./data` volume mount exposes it to the container as `/app/data/cookies.txt` and yt-dlp will pick it up automatically on the next request.
+- The feature is optional; if the file is absent, the bot continues running normally.
+
 ### Upload timeout
 - Check if Local Bot API is running
 - Increase timeout values in code
