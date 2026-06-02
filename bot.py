@@ -20,7 +20,7 @@ from handlers import (
     handle_playlist_command, handle_message, 
     handle_subscribe_video, handle_subscribe_live,
     handle_unsubscribe, handle_subscriptions, cancel_callback, audio_callback,
-    handle_settings, settings_callback
+    handle_settings, settings_callback, stop_live_callback
 )
 from queue_processor import process_queue, process_playlist_queue
 from subscription import SubscriptionMonitor
@@ -120,6 +120,7 @@ def main():
     
     # Callback handlers
     application.add_handler(CallbackQueryHandler(cancel_callback, pattern="^cancel:"))
+    application.add_handler(CallbackQueryHandler(stop_live_callback, pattern="^stoplive:"))
     application.add_handler(CallbackQueryHandler(audio_callback, pattern="^audio:"))
     application.add_handler(CallbackQueryHandler(settings_callback, pattern="^(set_mode|set_res:)"))
     

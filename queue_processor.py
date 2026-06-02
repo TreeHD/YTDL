@@ -4,15 +4,14 @@ import asyncio
 import time
 import logging
 import glob
-import subprocess
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import RetryAfter, TelegramError
 
-from config import load_config, check_disk_space, check_ffmpeg, DOWNLOAD_DIR, get_ffmpeg_command
-from downloader import download_content, get_video_info, get_playlist_info, get_stream_url
+from config import load_config, check_disk_space, check_ffmpeg, DOWNLOAD_DIR, get_ffmpeg_command, get_proxy_list, get_cookie_file
+from downloader import download_content, get_video_info, get_playlist_info
 from uploader import upload_video_streaming, upload_audio_streaming, split_video, crop_to_square
-from handlers import cancelled_tasks
+from handlers import cancelled_tasks, stopped_tasks
 
 logger = logging.getLogger(__name__)
 
@@ -294,104 +293,183 @@ async def process_queue(application, request_queue):
             gc.collect()
 
 async def process_live_stream(application, chat_id, url, message_id, status_msg, task_id, update_status_msg, channel_name):
-    """Handle live stream recording with segmented uploads."""
-    try:
-        await update_status_msg("🔍 Getting live stream URL...", force=True)
-        loop = asyncio.get_running_loop()
-        stream_url, proxy_used = await loop.run_in_executor(None, lambda: get_stream_url(url))
-        if not stream_url:
-            await update_status_msg("❌ Could not extract stream URL.", force=True)
-            return
+    """Handle live stream recording using yt-dlp subprocess (handles cookies, proxies, token refresh natively)."""
+    SEGMENT_SIZE_BYTES = 1900 * 1024 * 1024  # 1.9GB per segment
 
-        # Prepare segment template in DOWNLOAD_DIR
-        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-        segment_template = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_%03d.mp4")
-        
-        # Start ffmpeg as a subprocess with proxy support if needed
-        cmd = [
-            get_ffmpeg_command(),
-            '-i', stream_url,
-            '-c', 'copy',
-            '-f', 'segment',
-            '-segment_size', '1900M',
-            '-reset_timestamps', '1',
-            segment_template
+    live_keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("⏹ Stop & Upload", callback_data=f"stoplive:{task_id}"),
+            InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{task_id}"),
         ]
-        
-        env = os.environ.copy()
-        if proxy_used:
-            env['http_proxy'] = proxy_used
-            env['https_proxy'] = proxy_used
-            logger.info(f"Using proxy for ffmpeg: {proxy_used}")
-        
-        logger.info(f"Starting live recording: {' '.join(cmd)}")
-        process = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
-        
-        await update_status_msg(f"🔴 Recording live stream: {channel_name}\nSegments upload at 1.9GB.", force=True)
-        
-        uploaded_segments = set()
-        
+    ])
+
+    async def live_status(text):
+        nonlocal status_msg
+        try:
+            if status_msg:
+                if status_msg.text != text:
+                    await tg_retry(status_msg.edit_text, text, reply_markup=live_keyboard)
+            else:
+                status_msg = await tg_retry(
+                    application.bot.send_message,
+                    chat_id=chat_id, text=text, reply_to_message_id=message_id, reply_markup=live_keyboard
+                )
+        except Exception as e:
+            logger.warning(f"Failed to update live status: {e}")
+
+    def _build_ytdlp_cmd(output_path, proxy=None):
+        cmd = [
+            'yt-dlp',
+            '--no-part',
+            '--format', 'bestvideo[height<=1080]+bestaudio/best',
+            '--merge-output-format', 'mp4',
+            '--ffmpeg-location', get_ffmpeg_command(),
+            '--socket-timeout', '30',
+            '--retries', '10',
+            '--fragment-retries', '10',
+            '--no-check-certificates',
+            '--no-playlist',
+            '--quiet',
+            '--no-warnings',
+            '-o', output_path,
+        ]
+        cookie_file = get_cookie_file()
+        if cookie_file:
+            cmd += ['--cookies', cookie_file]
+        if proxy:
+            cmd += ['--proxy', proxy]
+        cmd.append(url)
+        return cmd
+
+    try:
+        await live_status(f"🔴 Recording live stream: {channel_name}")
+        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+        proxy_list = get_proxy_list()
+        segment_num = 0
+        uploaded_segments = []
+
         while True:
-            # Check for immediate process death
-            if process.returncode is not None:
-                break
-                
-            pattern = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_*.mp4")
-            files = sorted(glob.glob(pattern))
-            
-            if len(files) > 1:
-                to_upload = files[:-1]
-                for f_path in to_upload:
-                    if f_path not in uploaded_segments:
-                        seg_num = len(uploaded_segments) + 1
-                        await update_status_msg(f"🔴 Recording... (Uploading Segment {seg_num})", force=True)
-                        title = f"🔴 {channel_name} - LIVE Part {seg_num}"
-                        await handle_upload(application, chat_id, f_path, title, url, False, update_status_msg, channel_name, message_id)
-                        uploaded_segments.add(f_path)
-            
-            for _ in range(5):
+            if task_id in cancelled_tasks:
+                cancelled_tasks.discard(task_id)
+                await update_status_msg("❌ Live recording cancelled.", force=True)
+                _cleanup_live_files(task_id)
+                return
+
+            segment_num += 1
+            seg_path = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_{segment_num:03d}.mp4")
+
+            process = None
+            success = False
+            user_stopped = False
+
+            for proxy in proxy_list:
                 if task_id in cancelled_tasks:
-                    try:
+                    break
+
+                cmd = _build_ytdlp_cmd(seg_path, proxy)
+                logger.info(f"Live recording cmd: {' '.join(cmd)}")
+
+                process = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+
+                size_limit_hit = False
+                user_stopped = False
+                while True:
+                    if process.returncode is not None:
+                        break
+
+                    if task_id in cancelled_tasks:
                         process.terminate()
                         await process.wait()
-                    except: pass
-                    await update_status_msg("❌ Live recording cancelled.", force=True)
-                    for f in glob.glob(pattern):
-                        try: os.remove(f)
-                        except: pass
-                    cancelled_tasks.discard(task_id)
-                    return
-                await asyncio.sleep(2)
-            
-            if process.returncode is not None:
-                break
-                
-        # Final upload (or error check if process died early)
-        if process.returncode != 0 and process.returncode is not None and not uploaded_segments:
-            await update_status_msg(f"❌ ffmpeg recording failed (Exit code: {process.returncode}). Possible geo-restriction or stream issue.", force=True)
-            return
+                        cancelled_tasks.discard(task_id)
+                        await update_status_msg("❌ Live recording cancelled.", force=True)
+                        _cleanup_live_files(task_id)
+                        return
 
-        pattern = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_*.mp4")
-        files = sorted(glob.glob(pattern))
-        for f_path in files:
-            if f_path not in uploaded_segments:
-                seg_num = len(uploaded_segments) + 1
-                await update_status_msg(f"⬆️ Uploading final segment {seg_num}...", force=True)
-                title = f"🔴 {channel_name} - LIVE Part {seg_num} (End)"
-                await handle_upload(application, chat_id, f_path, title, url, False, update_status_func=update_status_msg, channel_name=channel_name, reply_to_message_id=message_id)
-                uploaded_segments.add(f_path)
-                
+                    if task_id in stopped_tasks:
+                        user_stopped = True
+                        process.terminate()
+                        await process.wait()
+                        stopped_tasks.discard(task_id)
+                        break
+
+                    if os.path.exists(seg_path) and os.path.getsize(seg_path) >= SEGMENT_SIZE_BYTES:
+                        size_limit_hit = True
+                        process.terminate()
+                        await process.wait()
+                        break
+
+                    await asyncio.sleep(3)
+
+                if user_stopped or size_limit_hit:
+                    success = True
+                    break
+
+                if process.returncode == 0:
+                    success = True
+                    break
+
+                stderr_out = b''
+                try:
+                    stderr_out = await asyncio.wait_for(process.stderr.read(), timeout=5)
+                except:
+                    pass
+                stderr_str = stderr_out.decode(errors='replace')
+                logger.warning(f"yt-dlp live recording failed (proxy={proxy}, rc={process.returncode}): {stderr_str[:500]}")
+
+                if 'is not currently live' in stderr_str or 'live event will begin' in stderr_str:
+                    if not uploaded_segments and (not os.path.exists(seg_path) or os.path.getsize(seg_path) == 0):
+                        await update_status_msg("❌ Stream is not currently live.", force=True)
+                        _cleanup_live_files(task_id)
+                        return
+                    success = True
+                    break
+
+                if os.path.exists(seg_path) and os.path.getsize(seg_path) == 0:
+                    try: os.remove(seg_path)
+                    except: pass
+                continue
+
+            if not success and not uploaded_segments:
+                await update_status_msg("❌ Could not record live stream. All proxies failed.", force=True)
+                _cleanup_live_files(task_id)
+                return
+
+            # Upload segment if it has content
+            if os.path.exists(seg_path) and os.path.getsize(seg_path) > 0:
+                is_final = not size_limit_hit or user_stopped
+                title = f"🔴 {channel_name} - LIVE Part {segment_num}"
+                if is_final and (segment_num > 1 or uploaded_segments):
+                    title += " (End)"
+                await update_status_msg(f"⬆️ Uploading segment {segment_num}...", force=True)
+                await handle_upload(application, chat_id, seg_path, title, url, False, update_status_msg, channel_name, message_id)
+                uploaded_segments.append(seg_path)
+
+            if not size_limit_hit or user_stopped:
+                break
+
+            await live_status(f"🔴 Recording continues... (Segment {segment_num} uploaded)")
+
         if status_msg:
             try: await tg_retry(status_msg.delete)
             except: pass
-            
+
     except Exception as e:
         logger.error(f"Error in process_live_stream: {e}")
-        pattern = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_*.mp4")
-        for f in glob.glob(pattern):
-            try: os.remove(f)
-            except: pass
+        _cleanup_live_files(task_id)
         await update_status_msg(f"🔥 Live recording error: {e}", force=True)
+
+
+def _cleanup_live_files(task_id):
+    """Remove any leftover live recording segments."""
+    pattern = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_*.mp4")
+    for f in glob.glob(pattern):
+        try: os.remove(f)
+        except: pass
 
 async def process_playlist_queue(application, playlist_queue):
     """Process playlist download queue SEQUENTIALLY to save space."""

@@ -28,6 +28,9 @@ logger = logging.getLogger(__name__)
 # Track cancelled tasks
 cancelled_tasks = set()
 
+# Track "stop & upload" requests for live recordings
+stopped_tasks = set()
+
 # --- Command Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start and /help commands."""
@@ -452,18 +455,31 @@ async def cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle cancel button callback."""
     query = update.callback_query
     await query.answer("Cancelling...")
-    
+
     data = query.data
     if not data.startswith("cancel:"):
         return
-    
+
     task_id = data[7:]
     cancelled_tasks.add(task_id)
-    
+
     try:
         await query.message.delete()
     except Exception as e:
         logger.warning(f"Could not delete cancel message: {e}")
+
+
+async def stop_live_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle stop & upload button for live recordings."""
+    query = update.callback_query
+    await query.answer("Stopping recording, will upload...")
+
+    data = query.data
+    if not data.startswith("stoplive:"):
+        return
+
+    task_id = data[9:]
+    stopped_tasks.add(task_id)
 
 async def audio_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle Audio download button callback."""
