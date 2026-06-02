@@ -226,6 +226,7 @@ async def process_queue(application, request_queue):
                 # If info extraction reveals it IS a live stream, handle it
                 if video_info.get('is_live'):
                     logger.info(f"URL detected as LIVE during info check: {url}")
+                    channel_name = channel_name or video_info.get('uploader') or video_info.get('title', 'Live')
                     asyncio.create_task(process_live_stream(application, chat_id, url, message_id, status_msg, task_id, update_status_msg, channel_name))
                     continue
             except asyncio.TimeoutError:
@@ -321,8 +322,8 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
         cmd = [
             'yt-dlp',
             '--no-part',
-            '--format', 'bestvideo[height<=1080]+bestaudio/best',
-            '--merge-output-format', 'mp4',
+            '--format', 'best[height<=1080]/best',
+            '--hls-use-mpegts',
             '--ffmpeg-location', get_ffmpeg_command(),
             '--socket-timeout', '30',
             '--retries', '10',
@@ -357,6 +358,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                 return
 
             segment_num += 1
+            seg_path_ts = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_{segment_num:03d}.ts")
             seg_path = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_{segment_num:03d}.mp4")
 
             process = None
@@ -367,7 +369,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                 if task_id in cancelled_tasks:
                     break
 
-                cmd = _build_ytdlp_cmd(seg_path, proxy)
+                cmd = _build_ytdlp_cmd(seg_path_ts, proxy)
                 logger.info(f"Live recording cmd: {' '.join(cmd)}")
 
                 process = await asyncio.create_subprocess_exec(
@@ -397,7 +399,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                         stopped_tasks.discard(task_id)
                         break
 
-                    if os.path.exists(seg_path) and os.path.getsize(seg_path) >= SEGMENT_SIZE_BYTES:
+                    if os.path.exists(seg_path_ts) and os.path.getsize(seg_path_ts) >= SEGMENT_SIZE_BYTES:
                         size_limit_hit = True
                         process.terminate()
                         await process.wait()
@@ -422,15 +424,15 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                 logger.warning(f"yt-dlp live recording failed (proxy={proxy}, rc={process.returncode}): {stderr_str[:500]}")
 
                 if 'is not currently live' in stderr_str or 'live event will begin' in stderr_str:
-                    if not uploaded_segments and (not os.path.exists(seg_path) or os.path.getsize(seg_path) == 0):
+                    if not uploaded_segments and (not os.path.exists(seg_path_ts) or os.path.getsize(seg_path_ts) == 0):
                         await update_status_msg("❌ Stream is not currently live.", force=True)
                         _cleanup_live_files(task_id)
                         return
                     success = True
                     break
 
-                if os.path.exists(seg_path) and os.path.getsize(seg_path) == 0:
-                    try: os.remove(seg_path)
+                if os.path.exists(seg_path_ts) and os.path.getsize(seg_path_ts) == 0:
+                    try: os.remove(seg_path_ts)
                     except: pass
                 continue
 
@@ -438,6 +440,18 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                 await update_status_msg("❌ Could not record live stream. All proxies failed.", force=True)
                 _cleanup_live_files(task_id)
                 return
+
+            # Remux .ts → .mp4 (ts is valid when truncated, mp4 needs proper container)
+            if os.path.exists(seg_path_ts) and os.path.getsize(seg_path_ts) > 0:
+                remux = await asyncio.create_subprocess_exec(
+                    get_ffmpeg_command(), '-y', '-i', seg_path_ts,
+                    '-c', 'copy', '-movflags', '+faststart', seg_path,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await remux.wait()
+                try: os.remove(seg_path_ts)
+                except: pass
 
             # Upload segment if it has content
             if os.path.exists(seg_path) and os.path.getsize(seg_path) > 0:
@@ -466,10 +480,11 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
 
 def _cleanup_live_files(task_id):
     """Remove any leftover live recording segments."""
-    pattern = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_*.mp4")
-    for f in glob.glob(pattern):
-        try: os.remove(f)
-        except: pass
+    for ext in ['*.mp4', '*.ts']:
+        pattern = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_{ext}")
+        for f in glob.glob(pattern):
+            try: os.remove(f)
+            except: pass
 
 async def process_playlist_queue(application, playlist_queue):
     """Process playlist download queue SEQUENTIALLY to save space."""
