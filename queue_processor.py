@@ -292,6 +292,23 @@ async def process_queue(application, request_queue):
         finally:
             request_queue.task_done()
             gc.collect()
+
+async def _kill_process(process, task_id):
+    """Terminate process, wait with timeout, kill if stuck."""
+    try:
+        process.terminate()
+        await asyncio.wait_for(process.wait(), timeout=5)
+        logger.info(f"[LIVE:{task_id}] Process terminated gracefully")
+    except asyncio.TimeoutError:
+        logger.warning(f"[LIVE:{task_id}] Process didn't exit after SIGTERM, sending SIGKILL")
+        try:
+            process.kill()
+            await asyncio.wait_for(process.wait(), timeout=3)
+        except Exception:
+            logger.error(f"[LIVE:{task_id}] SIGKILL also failed, process may be orphaned")
+    except Exception as e:
+        logger.error(f"[LIVE:{task_id}] _kill_process error: {e}", exc_info=True)
+
 async def process_live_stream(application, chat_id, url, message_id, status_msg, task_id, update_status_msg, channel_name):
     """Handle live stream recording using yt-dlp subprocess (handles cookies, proxies, token refresh natively)."""
     SEGMENT_SIZE_BYTES = 1900 * 1024 * 1024  # 1.9GB per segment
@@ -399,11 +416,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
 
                     if task_id in cancelled_tasks:
                         logger.info(f"[LIVE:{task_id}] Cancel signal, terminating")
-                        try:
-                            process.terminate()
-                            await process.wait()
-                        except Exception as e:
-                            logger.error(f"[LIVE:{task_id}] terminate error: {e}", exc_info=True)
+                        await _kill_process(process, task_id)
                         cancelled_tasks.discard(task_id)
                         await update_status_msg("❌ Live recording cancelled.", force=True)
                         _cleanup_live_files(task_id)
@@ -412,11 +425,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                     if task_id in stopped_tasks:
                         logger.info(f"[LIVE:{task_id}] Stop & Upload signal, terminating")
                         user_stopped = True
-                        try:
-                            process.terminate()
-                            await process.wait()
-                        except Exception as e:
-                            logger.error(f"[LIVE:{task_id}] terminate error: {e}", exc_info=True)
+                        await _kill_process(process, task_id)
                         stopped_tasks.discard(task_id)
                         break
 
@@ -428,11 +437,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                     if file_size >= SEGMENT_SIZE_BYTES:
                         logger.info(f"[LIVE:{task_id}] Size limit hit: {file_size/(1024*1024):.1f}MB")
                         size_limit_hit = True
-                        try:
-                            process.terminate()
-                            await process.wait()
-                        except Exception as e:
-                            logger.error(f"[LIVE:{task_id}] terminate error: {e}", exc_info=True)
+                        await _kill_process(process, task_id)
                         break
 
                     poll_count += 1
@@ -482,7 +487,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                 _cleanup_live_files(task_id)
                 return
 
-            # Remux .ts -> .mp4
+            # Remux .ts -> .mp4 (Telegram requires mp4)
             ts_exists = os.path.exists(seg_path_ts)
             ts_size = os.path.getsize(seg_path_ts) if ts_exists else 0
             logger.info(f"[LIVE:{task_id}] Remux: ts_exists={ts_exists} ts_size={ts_size/(1024*1024):.1f}MB")
@@ -499,14 +504,27 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                     await remux.wait()
                     logger.info(f"[LIVE:{task_id}] Remux rc={remux.returncode}")
                     if remux.returncode != 0:
-                        logger.error(f"[LIVE:{task_id}] Remux FAILED: {remux_stderr.decode(errors='replace')[:500]}")
-                        seg_path = seg_path_ts  # fallback: upload .ts directly
+                        logger.warning(f"[LIVE:{task_id}] Remux with faststart failed, retrying without: {remux_stderr.decode(errors='replace')[:300]}")
+                        # Retry without faststart (works better on truncated streams)
+                        remux2 = await asyncio.create_subprocess_exec(
+                            get_ffmpeg_command(), '-y', '-i', seg_path_ts,
+                            '-c', 'copy', seg_path,
+                            stdout=asyncio.subprocess.DEVNULL,
+                            stderr=asyncio.subprocess.PIPE,
+                        )
+                        remux2_stderr = await remux2.stderr.read()
+                        await remux2.wait()
+                        logger.info(f"[LIVE:{task_id}] Remux retry rc={remux2.returncode}")
+                        if remux2.returncode != 0:
+                            logger.error(f"[LIVE:{task_id}] Remux retry FAILED: {remux2_stderr.decode(errors='replace')[:300]}")
+                        else:
+                            try: os.remove(seg_path_ts)
+                            except: pass
                     else:
                         try: os.remove(seg_path_ts)
                         except: pass
                 except Exception as e:
                     logger.error(f"[LIVE:{task_id}] Remux exception: {e}", exc_info=True)
-                    seg_path = seg_path_ts
             elif ts_exists and ts_size == 0:
                 logger.warning(f"[LIVE:{task_id}] .ts is empty, skipping")
                 try: os.remove(seg_path_ts)
