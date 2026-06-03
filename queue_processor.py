@@ -348,6 +348,8 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
             '--no-part',
             '--format', 'best[height<=1080]/best',
             '--hls-use-mpegts',
+            '--downloader', 'ffmpeg',
+            '--downloader-args', 'ffmpeg:-f mpegts',
             '--ffmpeg-location', get_ffmpeg_command(),
             '--socket-timeout', '30',
             '--retries', '10',
@@ -562,6 +564,9 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                 size_limit_hit = False
                 user_stopped = False
                 poll_count = 0
+                last_size = 0
+                last_size_change = time.time()
+                STALL_TIMEOUT = 60  # seconds without file growth = stalled
 
                 while True:
                     if process.returncode is not None:
@@ -599,6 +604,17 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                         logger.info(f"[LIVE:{task_id}] Size limit hit: {file_size/(1024*1024):.1f}MB")
                         size_limit_hit = True
                         await _kill_process(process, task_id)
+                        break
+
+                    # Stall detection: if file size hasn't grown for STALL_TIMEOUT, kill and retry/upload
+                    if file_size > last_size:
+                        last_size = file_size
+                        last_size_change = time.time()
+                    elif file_size > 0 and (time.time() - last_size_change) > STALL_TIMEOUT:
+                        logger.warning(f"[LIVE:{task_id}] STALL detected: no growth for {STALL_TIMEOUT}s at {file_size/(1024*1024):.1f}MB, killing process")
+                        await _kill_process(process, task_id)
+                        # Treat as segment done — upload what we have and start new segment
+                        size_limit_hit = True
                         break
 
                     poll_count += 1
