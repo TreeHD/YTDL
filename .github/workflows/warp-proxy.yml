@@ -1,11 +1,10 @@
-name: Build and Publish Docker Image
+name: Build and Publish Warp Proxy
 
 on:
   push:
     branches: [ "main", "master" ]
+    paths: [ "warp/**" ]
     tags: [ 'v*' ]
-  pull_request:
-    branches: [ "main", "master" ]
   workflow_dispatch:
 
 env:
@@ -37,7 +36,6 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to Docker Registry
-        if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -51,7 +49,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-warp-proxy
           tags: |
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
             type=semver,pattern={{version}}
@@ -67,32 +65,29 @@ jobs:
         id: build
         uses: docker/build-push-action@v6
         with:
-          context: .
+          context: ./warp
           platforms: ${{ matrix.os.platform }}
           labels: ${{ steps.meta.outputs.labels }}
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
-          cache-from: type=gha,scope=ytdl-${{ steps.plat.outputs.pair }}
-          cache-to: type=gha,scope=ytdl-${{ steps.plat.outputs.pair }},mode=max
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-warp-proxy,push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=warp-proxy-${{ steps.plat.outputs.pair }}
+          cache-to: type=gha,scope=warp-proxy-${{ steps.plat.outputs.pair }},mode=max
 
       - name: Export digest
-        if: github.event_name != 'pull_request'
         run: |
           mkdir -p /tmp/digests
           digest="${{ steps.build.outputs.digest }}"
           touch "/tmp/digests/${digest#sha256:}"
 
       - name: Upload digest
-        if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@v4
         with:
-          name: digests-ytdl-${{ steps.plat.outputs.pair }}
+          name: digests-warp-proxy-${{ steps.plat.outputs.pair }}
           path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 1
 
   merge:
     runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request'
     needs: build
     permissions:
       contents: read
@@ -103,7 +98,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: /tmp/digests
-          pattern: digests-ytdl-*
+          pattern: digests-warp-proxy-*
           merge-multiple: true
 
       - name: Set lowercased IMAGE_NAME
@@ -116,7 +111,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-warp-proxy
           tags: |
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
             type=semver,pattern={{version}}
@@ -133,6 +128,6 @@ jobs:
         working-directory: /tmp/digests
         run: |
           docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-warp-proxy@sha256:%s ' *)
         env:
           DOCKER_METADATA_OUTPUT_JSON: ${{ steps.meta.outputs.json }}

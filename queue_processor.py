@@ -11,7 +11,7 @@ from telegram.error import RetryAfter, TelegramError
 from config import load_config, check_disk_space, check_ffmpeg, DOWNLOAD_DIR, get_ffmpeg_command, get_proxy_list, get_cookie_file
 from downloader import download_content, get_video_info, get_playlist_info
 from uploader import upload_video_streaming, upload_audio_streaming, split_video, crop_to_square
-from handlers import cancelled_tasks, stopped_tasks, livenow_tasks
+from handlers import cancelled_tasks, stopped_tasks, fromstart_tasks
 
 logger = logging.getLogger(__name__)
 
@@ -310,19 +310,19 @@ async def _kill_process(process, task_id):
         logger.error(f"[LIVE:{task_id}] _kill_process error: {e}", exc_info=True)
 
 async def process_live_stream(application, chat_id, url, message_id, status_msg, task_id, update_status_msg, channel_name):
-    """Handle live stream recording using yt-dlp subprocess (handles cookies, proxies, token refresh natively)."""
+    """Handle live stream recording using yt-dlp subprocess (handles cookies, proxies, token refresh natively).
+    Default: record from now. Button to download from start in background."""
     SEGMENT_SIZE_BYTES = 1900 * 1024 * 1024  # 1.9GB per segment
     logger.info(f"[LIVE:{task_id}] START url={url}, chat_id={chat_id}, channel={channel_name}")
 
-    live_from_start = True  # Default: download from beginning if DVR available
+    fromstart_triggered = False
 
     def _make_keyboard():
-        buttons = [
-            InlineKeyboardButton("⏹ Stop & Upload", callback_data=f"stoplive:{task_id}"),
-            InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{task_id}"),
-        ]
-        if live_from_start:
-            buttons.insert(0, InlineKeyboardButton("⏩ From Now", callback_data=f"livenow:{task_id}"))
+        buttons = []
+        if not fromstart_triggered:
+            buttons.append(InlineKeyboardButton("⏪ From Start", callback_data=f"fromstart:{task_id}"))
+        buttons.append(InlineKeyboardButton("⏹ Stop & Upload", callback_data=f"stoplive:{task_id}"))
+        buttons.append(InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{task_id}"))
         return InlineKeyboardMarkup([buttons])
 
     async def live_status(text):
@@ -342,7 +342,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
         except Exception as e:
             logger.error(f"[LIVE:{task_id}] live_status failed: {e}", exc_info=True)
 
-    def _build_ytdlp_cmd(output_path, proxy=None):
+    def _build_ytdlp_cmd(output_path, proxy=None, from_start=False):
         cmd = [
             'yt-dlp',
             '--no-part',
@@ -356,7 +356,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
             '--no-playlist',
             '-o', output_path,
         ]
-        if live_from_start:
+        if from_start:
             cmd.append('--live-from-start')
         cookie_file = get_cookie_file()
         if cookie_file:
@@ -366,9 +366,155 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
         cmd.append(url)
         return cmd
 
+    async def _download_from_start():
+        """Background task: download the stream from beginning up to current point."""
+        bg_id = f"{task_id}_fromstart"
+        logger.info(f"[LIVE:{bg_id}] Background from-start download starting")
+        proxy_list = get_proxy_list()
+
+        seg_num = 0
+        while True:
+            seg_num += 1
+            bg_ts = os.path.join(DOWNLOAD_DIR, f"live_{bg_id}_{seg_num:03d}.ts")
+            bg_mp4 = os.path.join(DOWNLOAD_DIR, f"live_{bg_id}_{seg_num:03d}.mp4")
+
+            success = False
+            for proxy in proxy_list:
+                cmd = _build_ytdlp_cmd(bg_ts, proxy, from_start=True)
+                logger.info(f"[LIVE:{bg_id}] cmd: {' '.join(cmd)}")
+
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        *cmd,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    logger.info(f"[LIVE:{bg_id}] pid={proc.pid}")
+                except Exception as e:
+                    logger.error(f"[LIVE:{bg_id}] Spawn failed: {e}", exc_info=True)
+                    continue
+
+                # Monitor for size limit or task cancel
+                size_hit = False
+                while True:
+                    if proc.returncode is not None:
+                        break
+                    if task_id in cancelled_tasks:
+                        await _kill_process(proc, bg_id)
+                        _cleanup_live_files(bg_id)
+                        logger.info(f"[LIVE:{bg_id}] Cancelled")
+                        return
+                    try:
+                        fsize = os.path.getsize(bg_ts) if os.path.exists(bg_ts) else 0
+                    except OSError:
+                        fsize = 0
+                    if fsize >= SEGMENT_SIZE_BYTES:
+                        size_hit = True
+                        await _kill_process(proc, bg_id)
+                        break
+                    await asyncio.sleep(3)
+
+                if size_hit:
+                    success = True
+                    break
+
+                if proc.returncode == 0:
+                    success = True
+                    break
+
+                # Check error
+                stderr_out = b''
+                try:
+                    stderr_out = await asyncio.wait_for(proc.stderr.read(), timeout=5)
+                except Exception:
+                    pass
+                stderr_str = stderr_out.decode(errors='replace')
+                logger.warning(f"[LIVE:{bg_id}] Failed proxy={proxy} rc={proc.returncode}: {stderr_str[:500]}")
+
+                # No DVR available — not a proxy issue
+                if 'not available' in stderr_str.lower() or 'requested format' in stderr_str.lower():
+                    logger.info(f"[LIVE:{bg_id}] No DVR/from-start support for this stream")
+                    try:
+                        await tg_retry(
+                            application.bot.send_message,
+                            chat_id=chat_id, text="⚠️ This stream doesn't support playback from start (no DVR).",
+                            reply_to_message_id=message_id
+                        )
+                    except Exception:
+                        pass
+                    _cleanup_live_files(bg_id)
+                    return
+
+                if os.path.exists(bg_ts) and os.path.getsize(bg_ts) == 0:
+                    try: os.remove(bg_ts)
+                    except: pass
+                continue
+
+            if not success:
+                logger.error(f"[LIVE:{bg_id}] All proxies failed")
+                try:
+                    await tg_retry(
+                        application.bot.send_message,
+                        chat_id=chat_id, text="❌ From-start download failed.",
+                        reply_to_message_id=message_id
+                    )
+                except Exception:
+                    pass
+                _cleanup_live_files(bg_id)
+                return
+
+            # Remux and upload
+            ts_size = os.path.getsize(bg_ts) if os.path.exists(bg_ts) else 0
+            if ts_size > 0:
+                try:
+                    remux = await asyncio.create_subprocess_exec(
+                        get_ffmpeg_command(), '-y', '-i', bg_ts,
+                        '-c', 'copy', '-movflags', '+faststart', bg_mp4,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    remux_err = await remux.stderr.read()
+                    await remux.wait()
+                    if remux.returncode != 0:
+                        # Retry without faststart
+                        remux2 = await asyncio.create_subprocess_exec(
+                            get_ffmpeg_command(), '-y', '-i', bg_ts,
+                            '-c', 'copy', bg_mp4,
+                            stdout=asyncio.subprocess.DEVNULL,
+                            stderr=asyncio.subprocess.DEVNULL,
+                        )
+                        await remux2.wait()
+                    if os.path.exists(bg_mp4) and os.path.getsize(bg_mp4) > 0:
+                        try: os.remove(bg_ts)
+                        except: pass
+                    else:
+                        logger.error(f"[LIVE:{bg_id}] Remux produced no output")
+                        try: os.remove(bg_ts)
+                        except: pass
+                        continue
+                except Exception as e:
+                    logger.error(f"[LIVE:{bg_id}] Remux error: {e}", exc_info=True)
+                    try: os.remove(bg_ts)
+                    except: pass
+                    continue
+
+                # Upload
+                try:
+                    title = f"⏪ {channel_name} - From Start Part {seg_num}"
+                    logger.info(f"[LIVE:{bg_id}] Uploading: {title}")
+                    await handle_upload(application, chat_id, bg_mp4, title, url, False, update_status_msg, channel_name, message_id)
+                    logger.info(f"[LIVE:{bg_id}] Upload done seg {seg_num}")
+                except Exception as e:
+                    logger.error(f"[LIVE:{bg_id}] Upload failed: {e}", exc_info=True)
+
+            if not size_hit:
+                # Download finished naturally (caught up to live)
+                break
+
+        logger.info(f"[LIVE:{bg_id}] Background from-start download complete")
+
     try:
-        mode_label = "from start" if live_from_start else "from now"
-        await live_status(f"\U0001f534 Recording live stream ({mode_label}): {channel_name}")
+        await live_status(f"\U0001f534 Recording live stream: {channel_name}")
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
         proxy_list = get_proxy_list()
@@ -399,7 +545,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                     logger.info(f"[LIVE:{task_id}] Cancelled in proxy loop")
                     break
 
-                cmd = _build_ytdlp_cmd(seg_path_ts, proxy)
+                cmd = _build_ytdlp_cmd(seg_path_ts, proxy, from_start=False)
                 logger.info(f"[LIVE:{task_id}] Proxy [{proxy_idx+1}/{len(proxy_list)}] cmd: {' '.join(cmd)}")
 
                 try:
@@ -437,13 +583,12 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                         stopped_tasks.discard(task_id)
                         break
 
-                    if task_id in livenow_tasks:
-                        logger.info(f"[LIVE:{task_id}] 'From Now' signal, switching mode")
-                        live_from_start = False
-                        await _kill_process(process, task_id)
-                        livenow_tasks.discard(task_id)
-                        size_limit_hit = True  # triggers upload of current segment + continue loop
-                        break
+                    if task_id in fromstart_tasks and not fromstart_triggered:
+                        logger.info(f"[LIVE:{task_id}] 'From Start' triggered, spawning background download")
+                        fromstart_triggered = True
+                        fromstart_tasks.discard(task_id)
+                        asyncio.create_task(_download_from_start())
+                        await live_status(f"\U0001f534 Recording: {channel_name}\n⏪ Downloading from start in background...")
 
                     try:
                         file_size = os.path.getsize(seg_path_ts) if os.path.exists(seg_path_ts) else 0
@@ -520,8 +665,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                     await remux.wait()
                     logger.info(f"[LIVE:{task_id}] Remux rc={remux.returncode}")
                     if remux.returncode != 0:
-                        logger.warning(f"[LIVE:{task_id}] Remux with faststart failed, retrying without: {remux_stderr.decode(errors='replace')[:300]}")
-                        # Retry without faststart (works better on truncated streams)
+                        logger.warning(f"[LIVE:{task_id}] Remux with faststart failed, retrying: {remux_stderr.decode(errors='replace')[:300]}")
                         remux2 = await asyncio.create_subprocess_exec(
                             get_ffmpeg_command(), '-y', '-i', seg_path_ts,
                             '-c', 'copy', seg_path,
@@ -572,7 +716,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                 logger.info(f"[LIVE:{task_id}] Done. size_limit_hit={size_limit_hit} user_stopped={user_stopped}")
                 break
 
-            await live_status(f"\U0001f534 Recording{'(from start)' if live_from_start else ''}: {channel_name} — Segment {segment_num} uploaded")
+            await live_status(f"\U0001f534 Recording: {channel_name} — Segment {segment_num} uploaded")
 
         logger.info(f"[LIVE:{task_id}] COMPLETE. Segments uploaded: {len(uploaded_segments)}")
         if status_msg:
@@ -592,10 +736,11 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
 def _cleanup_live_files(task_id):
     """Remove any leftover live recording segments."""
     for ext in ['*.mp4', '*.ts']:
-        pattern = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_{ext}")
-        for f in glob.glob(pattern):
-            try: os.remove(f)
-            except: pass
+        for prefix in [f"live_{task_id}_{ext}", f"live_{task_id}_fromstart_{ext}"]:
+            pattern = os.path.join(DOWNLOAD_DIR, prefix)
+            for f in glob.glob(pattern):
+                try: os.remove(f)
+                except: pass
 
 async def process_playlist_queue(application, playlist_queue):
     """Process playlist download queue SEQUENTIALLY to save space."""
