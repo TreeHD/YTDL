@@ -11,7 +11,7 @@ from telegram.error import RetryAfter, TelegramError
 from config import load_config, check_disk_space, check_ffmpeg, DOWNLOAD_DIR, get_ffmpeg_command, get_proxy_list, get_cookie_file
 from downloader import download_content, get_video_info, get_playlist_info
 from uploader import upload_video_streaming, upload_audio_streaming, split_video, crop_to_square
-from handlers import cancelled_tasks, stopped_tasks
+from handlers import cancelled_tasks, stopped_tasks, livenow_tasks
 
 logger = logging.getLogger(__name__)
 
@@ -314,24 +314,29 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
     SEGMENT_SIZE_BYTES = 1900 * 1024 * 1024  # 1.9GB per segment
     logger.info(f"[LIVE:{task_id}] START url={url}, chat_id={chat_id}, channel={channel_name}")
 
-    live_keyboard = InlineKeyboardMarkup([
-        [
+    live_from_start = True  # Default: download from beginning if DVR available
+
+    def _make_keyboard():
+        buttons = [
             InlineKeyboardButton("⏹ Stop & Upload", callback_data=f"stoplive:{task_id}"),
             InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{task_id}"),
         ]
-    ])
+        if live_from_start:
+            buttons.insert(0, InlineKeyboardButton("⏩ From Now", callback_data=f"livenow:{task_id}"))
+        return InlineKeyboardMarkup([buttons])
 
     async def live_status(text):
         nonlocal status_msg
         try:
+            keyboard = _make_keyboard()
             logger.info(f"[LIVE:{task_id}] live_status: '{text}', has_msg={status_msg is not None}")
             if status_msg:
                 if status_msg.text != text:
-                    await tg_retry(status_msg.edit_text, text, reply_markup=live_keyboard)
+                    await tg_retry(status_msg.edit_text, text, reply_markup=keyboard)
             else:
                 status_msg = await tg_retry(
                     application.bot.send_message,
-                    chat_id=chat_id, text=text, reply_to_message_id=message_id, reply_markup=live_keyboard
+                    chat_id=chat_id, text=text, reply_to_message_id=message_id, reply_markup=keyboard
                 )
                 logger.info(f"[LIVE:{task_id}] Sent new status msg_id={status_msg.message_id if status_msg else None}")
         except Exception as e:
@@ -351,6 +356,8 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
             '--no-playlist',
             '-o', output_path,
         ]
+        if live_from_start:
+            cmd.append('--live-from-start')
         cookie_file = get_cookie_file()
         if cookie_file:
             cmd += ['--cookies', cookie_file]
@@ -360,7 +367,8 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
         return cmd
 
     try:
-        await live_status(f"\U0001f534 Recording live stream: {channel_name}")
+        mode_label = "from start" if live_from_start else "from now"
+        await live_status(f"\U0001f534 Recording live stream ({mode_label}): {channel_name}")
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
         proxy_list = get_proxy_list()
@@ -427,6 +435,14 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                         user_stopped = True
                         await _kill_process(process, task_id)
                         stopped_tasks.discard(task_id)
+                        break
+
+                    if task_id in livenow_tasks:
+                        logger.info(f"[LIVE:{task_id}] 'From Now' signal, switching mode")
+                        live_from_start = False
+                        await _kill_process(process, task_id)
+                        livenow_tasks.discard(task_id)
+                        size_limit_hit = True  # triggers upload of current segment + continue loop
                         break
 
                     try:
@@ -556,7 +572,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                 logger.info(f"[LIVE:{task_id}] Done. size_limit_hit={size_limit_hit} user_stopped={user_stopped}")
                 break
 
-            await live_status(f"\U0001f534 Recording continues... (Segment {segment_num} uploaded)")
+            await live_status(f"\U0001f534 Recording{'(from start)' if live_from_start else ''}: {channel_name} — Segment {segment_num} uploaded")
 
         logger.info(f"[LIVE:{task_id}] COMPLETE. Segments uploaded: {len(uploaded_segments)}")
         if status_msg:

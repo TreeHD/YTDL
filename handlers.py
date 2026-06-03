@@ -31,6 +31,9 @@ cancelled_tasks = set()
 # Track "stop & upload" requests for live recordings
 stopped_tasks = set()
 
+# Track "switch to live now" requests (abandon from-start, record from current)
+livenow_tasks = set()
+
 # --- Command Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start and /help commands."""
@@ -480,6 +483,19 @@ async def stop_live_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     task_id = data[9:]
     stopped_tasks.add(task_id)
+
+
+async def livenow_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle 'Record from now' button — switch from live-from-start to current."""
+    query = update.callback_query
+    await query.answer("Switching to record from now...")
+
+    data = query.data
+    if not data.startswith("livenow:"):
+        return
+
+    task_id = data[8:]
+    livenow_tasks.add(task_id)
 
 async def audio_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle Audio download button callback."""
