@@ -579,8 +579,10 @@ async def audio_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Audio conversion failed: {e}")
         await context.bot.send_message(chat_id=chat_id, text=f"❌ Audio download failed: {e}")
-        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🎵 Download Audio (Retry)", callback_data=f"audio:{url}")]
-        ]))
+        retry_cb = f"audio:{url}"
+        if len(retry_cb.encode('utf-8')) <= 64:
+            await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🎵 Download Audio (Retry)", callback_data=retry_cb)]
+            ]))
     finally:
         gc.collect()
