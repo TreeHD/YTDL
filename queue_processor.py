@@ -560,14 +560,14 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
         """Start a yt-dlp recording process, trying each proxy. Returns (process, proxy) or (None, None)."""
         for proxy in proxy_list:
             cmd = _build_record_cmd(seg_ts_path, proxy)
-            logger.info(f"[LIVE:{task_id}] yt-dlp cmd (proxy={proxy}): {' '.join(cmd[:10])}...")
+            logger.info(f"[LIVE:{task_id}] streamlink cmd (proxy={proxy}): {' '.join(cmd[:10])}...")
             try:
                 proc = await asyncio.create_subprocess_exec(
                     *cmd,
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.PIPE,
                 )
-                logger.info(f"[LIVE:{task_id}] yt-dlp pid={proc.pid} proxy={proxy}")
+                logger.info(f"[LIVE:{task_id}] streamlink pid={proc.pid} proxy={proxy}")
                 return proc, proxy
             except Exception as e:
                 logger.error(f"[LIVE:{task_id}] Spawn failed proxy={proxy}: {e}")

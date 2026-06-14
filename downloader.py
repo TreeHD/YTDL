@@ -80,8 +80,7 @@ def get_video_info(url):
             'socket_timeout': 10,
             'retries': 2,
             'nocheckcertificate': True,
-            'remote_components': 'ejs:github',
-        }
+                    }
         if proxy:
             ydl_opts['proxy'] = proxy
         _apply_cookie(ydl_opts)
@@ -127,8 +126,7 @@ def get_channel_info(channel_url):
             'socket_timeout': 10,
             'retries': 2,
             'nocheckcertificate': True,
-            'remote_components': 'ejs:github',
-            'no_color': True,
+                        'no_color': True,
         }
         if proxy:
             ydl_opts['proxy'] = proxy
@@ -150,10 +148,11 @@ def get_channel_info(channel_url):
     raise Exception("Could not extract channel info")
 
 def get_latest_videos(channel_id, limit=5):
-    """Get latest videos from a channel."""
+    """Get latest videos from a channel. Merges results across proxies to catch geo-restricted ones."""
     proxy_list = get_proxy_list()
     channel_url = f"https://www.youtube.com/channel/{channel_id}/videos"
-    
+    all_videos = {}
+
     for proxy in proxy_list:
         ydl_opts = {
             'quiet': True,
@@ -163,7 +162,6 @@ def get_latest_videos(channel_id, limit=5):
             'socket_timeout': 10,
             'retries': 2,
             'nocheckcertificate': True,
-            'remote_components': 'ejs:github',
             'no_color': True,
         }
         if proxy:
@@ -173,22 +171,22 @@ def get_latest_videos(channel_id, limit=5):
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(channel_url, download=False)
-                videos = []
                 for entry in info.get('entries', []):
-                    if entry:
-                        videos.append({
-                            'id': entry.get('id', ''),
-                            'title': entry.get('title', 'Unknown'),
-                            'url': entry.get('url') or f"https://www.youtube.com/watch?v={entry.get('id')}",
-                        })
-                return videos
+                    if entry and entry.get('id'):
+                        vid_id = entry['id']
+                        if vid_id not in all_videos:
+                            all_videos[vid_id] = {
+                                'id': vid_id,
+                                'title': entry.get('title', 'Unknown'),
+                                'url': entry.get('url') or f"https://www.youtube.com/watch?v={vid_id}",
+                            }
         except Exception as e:
             if is_geo_restricted_error(str(e), proxy):
                 continue
-            logger.warning(f"Failed to get latest videos: {e}")
-            return []
-    
-    return []
+            logger.warning(f"Failed to get latest videos via proxy={proxy}: {e}")
+            continue
+
+    return list(all_videos.values())[:limit]
 
 # --- Main Download Function ---
 def download_content(url, progress_callback=None, audio_only=False, audio_format='m4a', max_height=1080, task_id=None, cancelled_tasks=None):
@@ -233,8 +231,7 @@ def download_content(url, progress_callback=None, audio_only=False, audio_format
                 'socket_timeout': 30,
                 'retries': 3,
                 'nocheckcertificate': True,
-                'remote_components': 'ejs:github',
-            }
+                            }
         else:
             ydl_opts = {
                 'outtmpl': f'{DOWNLOAD_DIR}/%(title).80s [%(id)s].%(ext)s',
@@ -256,8 +253,7 @@ def download_content(url, progress_callback=None, audio_only=False, audio_format
                 'socket_timeout': 30,
                 'retries': 3,
                 'nocheckcertificate': True,
-                'remote_components': 'ejs:github',
-            }
+                            }
         
         if proxy:
             ydl_opts['proxy'] = proxy
@@ -344,8 +340,7 @@ def get_playlist_info(url):
             'socket_timeout': 10,
             'retries': 2,
             'nocheckcertificate': True,
-            'remote_components': 'ejs:github',
-            'no_color': True,
+                        'no_color': True,
         }
         if proxy:
             ydl_opts['proxy'] = proxy
@@ -399,7 +394,7 @@ def get_live_info(channel_id):
     """Check if a channel is currently live and get video info."""
     proxy_list = get_proxy_list()
     live_url = f"https://www.youtube.com/channel/{channel_id}/live"
-    
+
     for proxy in proxy_list:
         ydl_opts = {
             'quiet': True,
@@ -408,7 +403,6 @@ def get_live_info(channel_id):
             'socket_timeout': 10,
             'retries': 1,
             'nocheckcertificate': True,
-            'remote_components': 'ejs:github',
         }
         if proxy:
             ydl_opts['proxy'] = proxy
@@ -437,8 +431,7 @@ def get_stream_url(url):
             'format': 'best',
             'socket_timeout': 15,
             'nocheckcertificate': True,
-            'remote_components': 'ejs:github',
-        }
+                    }
         if proxy:
             ydl_opts['proxy'] = proxy
         _apply_cookie(ydl_opts)
