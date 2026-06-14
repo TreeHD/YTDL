@@ -506,8 +506,45 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
 
         logger.info(f"[LIVE:{bg_id}] Background from-start download complete")
 
+    async def _concat_parts(part_files, output_ts):
+        """Concatenate multiple .ts part files into one using ffmpeg concat."""
+        if len(part_files) == 1:
+            os.rename(part_files[0], output_ts)
+            return True
+        # Write concat list file
+        list_file = output_ts + '.list'
+        with open(list_file, 'w') as f:
+            for p in part_files:
+                f.write(f"file '{p}'\n")
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                get_ffmpeg_command(), '-y', '-f', 'concat', '-safe', '0',
+                '-i', list_file, '-c', 'copy', output_ts,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await proc.stderr.read()
+            await proc.wait()
+            if proc.returncode == 0:
+                for p in part_files:
+                    try: os.remove(p)
+                    except: pass
+                try: os.remove(list_file)
+                except: pass
+                return True
+            else:
+                logger.error(f"[LIVE:{task_id}] concat failed rc={proc.returncode}")
+                try: os.remove(list_file)
+                except: pass
+                return False
+        except Exception as e:
+            logger.error(f"[LIVE:{task_id}] concat error: {e}")
+            try: os.remove(list_file)
+            except: pass
+            return False
+
     async def _remux_and_upload(ts_path, mp4_path, seg_num, is_final=False):
-        """Background task: remux .ts to .mp4 and upload. No interruption to recording."""
+        """Background task: remux .ts to .mp4 and upload."""
         try:
             ts_size = os.path.getsize(ts_path) if os.path.exists(ts_path) else 0
             if ts_size == 0:
@@ -554,10 +591,10 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
         except Exception as e:
             logger.error(f"[LIVE:{task_id}] BG remux/upload seg {seg_num} error: {e}", exc_info=True)
 
-    async def _start_recording(seg_ts_path, proxy_list):
-        """Start a yt-dlp recording process, trying each proxy. Returns (process, proxy) or (None, None)."""
+    async def _start_recording(part_path, proxy_list):
+        """Start a streamlink recording process, trying each proxy. Returns (process, proxy) or (None, None)."""
         for proxy in proxy_list:
-            cmd = _build_record_cmd(seg_ts_path, proxy)
+            cmd = _build_record_cmd(part_path, proxy)
             logger.info(f"[LIVE:{task_id}] streamlink cmd (proxy={proxy}): {' '.join(cmd[:10])}...")
             try:
                 proc = await asyncio.create_subprocess_exec(
@@ -572,6 +609,16 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                 continue
         return None, None
 
+    def _get_total_parts_size(part_files):
+        """Get total size of all part files."""
+        total = 0
+        for p in part_files:
+            try:
+                total += os.path.getsize(p) if os.path.exists(p) else 0
+            except OSError:
+                pass
+        return total
+
     try:
         await live_status(f"\U0001f534 Starting live recording: {channel_name}")
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -583,10 +630,15 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
         consecutive_failures = 0
         bg_tasks = []
 
-        # Start first segment
-        segment_num = 1
-        seg_path_ts = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_{segment_num:03d}.ts")
-        process, used_proxy = await _start_recording(seg_path_ts, proxy_list)
+        # Parts accumulate until size limit, then get concat'd into a segment
+        part_num = 0
+        part_files = []
+
+        # Start first part
+        part_num = 1
+        current_part = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_p{part_num:03d}.ts")
+        part_files.append(current_part)
+        process, used_proxy = await _start_recording(current_part, proxy_list)
 
         if process is None:
             await update_status_msg("❌ Failed to start recording. All proxies failed.", force=True)
@@ -598,9 +650,8 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
 
         while True:
             if process.returncode is not None:
-                logger.info(f"[LIVE:{task_id}] yt-dlp exited rc={process.returncode}")
+                logger.info(f"[LIVE:{task_id}] streamlink exited rc={process.returncode}")
 
-                # Check if error or natural end
                 if process.returncode != 0:
                     stderr_out = b''
                     try:
@@ -608,61 +659,68 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                     except Exception:
                         pass
                     stderr_str = stderr_out.decode(errors='replace')
-                    logger.warning(f"[LIVE:{task_id}] yt-dlp error: {stderr_str[-500:]}")
+                    logger.warning(f"[LIVE:{task_id}] streamlink error: {stderr_str[-500:]}")
 
-                    ts_size = os.path.getsize(seg_path_ts) if os.path.exists(seg_path_ts) else 0
+                    current_size = os.path.getsize(current_part) if os.path.exists(current_part) else 0
 
                     if 'is not currently live' in stderr_str or 'live event will begin' in stderr_str:
-                        if ts_size == 0 and not uploaded_segments:
+                        if current_size == 0 and not uploaded_segments and _get_total_parts_size(part_files) == 0:
                             await update_status_msg("❌ Stream is not currently live.", force=True)
                             _cleanup_live_files(task_id)
                             return
 
-                    if ts_size == 0:
+                    if current_size == 0:
+                        # Remove empty part from list
+                        part_files = [p for p in part_files if p != current_part]
+                        try: os.remove(current_part)
+                        except: pass
+
                         consecutive_failures += 1
                         if consecutive_failures >= 3:
-                            if not uploaded_segments:
+                            # Stream probably dead — upload what we have
+                            if part_files:
+                                segment_num += 1
+                                seg_ts = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_{segment_num:03d}.ts")
+                                seg_mp4 = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_{segment_num:03d}.mp4")
+                                if await _concat_parts(part_files, seg_ts):
+                                    bg_tasks.append(asyncio.create_task(_remux_and_upload(seg_ts, seg_mp4, segment_num, is_final=True)))
+                                    uploaded_segments.append(segment_num)
+                                part_files = []
+                            elif not uploaded_segments:
                                 await update_status_msg(f"❌ Recording failed after {consecutive_failures} attempts.", force=True)
                             logger.error(f"[LIVE:{task_id}] {consecutive_failures} consecutive failures, giving up")
                             break
                         logger.info(f"[LIVE:{task_id}] No data, retry {consecutive_failures}/3 in 5s")
                         await asyncio.sleep(5)
-                        process, used_proxy = await _start_recording(seg_path_ts, proxy_list)
+                        # Reuse same part path
+                        current_part = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_p{part_num:03d}.ts")
+                        part_files.append(current_part)
+                        process, used_proxy = await _start_recording(current_part, proxy_list)
                         if process is None:
                             break
                         continue
                     else:
                         consecutive_failures = 0
-                        # Had data but crashed — remux/upload this segment, start new one
-                        seg_path_mp4 = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_{segment_num:03d}.mp4")
-                        bg_tasks.append(asyncio.create_task(_remux_and_upload(seg_path_ts, seg_path_mp4, segment_num)))
-                        uploaded_segments.append(segment_num)
-
-                        # Start next segment immediately
-                        segment_num += 1
-                        seg_path_ts = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_{segment_num:03d}.ts")
+                        # Had data but crashed — start new part, keep accumulating
+                        part_num += 1
+                        current_part = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_p{part_num:03d}.ts")
+                        part_files.append(current_part)
                         await live_status(f"\U0001f534 Reconnecting: {channel_name}")
                         await asyncio.sleep(3)
-                        process, used_proxy = await _start_recording(seg_path_ts, proxy_list)
+                        process, used_proxy = await _start_recording(current_part, proxy_list)
                         if process is None:
                             break
                         await live_status(f"\U0001f534 Recording live stream: {channel_name}")
                         continue
                 else:
-                    # rc=0: streamlink exited cleanly, but stream might still be live
-                    # Save current segment, then try to restart
-                    ts_size = os.path.getsize(seg_path_ts) if os.path.exists(seg_path_ts) else 0
-                    if ts_size > 0:
-                        seg_path_mp4 = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_{segment_num:03d}.mp4")
-                        bg_tasks.append(asyncio.create_task(_remux_and_upload(seg_path_ts, seg_path_mp4, segment_num)))
-                        uploaded_segments.append(segment_num)
-
-                    # Try to restart — if streamlink exits immediately again with no data, stream is truly over
-                    logger.info(f"[LIVE:{task_id}] streamlink exited rc=0, verifying if stream still live...")
+                    # rc=0: streamlink exited cleanly — try to restart
+                    consecutive_failures = 0
+                    logger.info(f"[LIVE:{task_id}] streamlink exited rc=0, trying to continue...")
                     await asyncio.sleep(3)
-                    segment_num += 1
-                    seg_path_ts = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_{segment_num:03d}.ts")
-                    process, used_proxy = await _start_recording(seg_path_ts, proxy_list)
+                    part_num += 1
+                    current_part = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_p{part_num:03d}.ts")
+                    part_files.append(current_part)
+                    process, used_proxy = await _start_recording(current_part, proxy_list)
                     if process is None:
                         logger.info(f"[LIVE:{task_id}] Cannot restart, stream ended")
                         break
@@ -671,19 +729,21 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                         await asyncio.sleep(3)
                         if process.returncode is not None:
                             break
-                        check_size = os.path.getsize(seg_path_ts) if os.path.exists(seg_path_ts) else 0
+                        check_size = os.path.getsize(current_part) if os.path.exists(current_part) else 0
                         if check_size > 0:
                             break
                     if process.returncode is not None:
-                        check_size = os.path.getsize(seg_path_ts) if os.path.exists(seg_path_ts) else 0
+                        check_size = os.path.getsize(current_part) if os.path.exists(current_part) else 0
                         if check_size == 0:
                             logger.info(f"[LIVE:{task_id}] Restart produced no data, stream truly ended")
-                            try: os.remove(seg_path_ts)
+                            part_files = [p for p in part_files if p != current_part]
+                            try: os.remove(current_part)
                             except: pass
                             break
-                    # Stream is still live — continue recording this new segment
-                    logger.info(f"[LIVE:{task_id}] Stream still live, continuing with segment {segment_num}")
-                    await live_status(f"\U0001f534 Recording: {channel_name} (Part {segment_num})")
+                    # Stream still live — continue accumulating
+                    logger.info(f"[LIVE:{task_id}] Stream still live, continuing (part {part_num})")
+                    total_mb = _get_total_parts_size(part_files) / (1024*1024)
+                    await live_status(f"\U0001f534 Recording: {channel_name} ({total_mb:.0f}MB)")
                     poll_count = 0
                     continue
 
@@ -701,11 +761,16 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                 logger.info(f"[LIVE:{task_id}] Stop & Upload signal")
                 await _kill_process(process, task_id)
                 stopped_tasks.discard(task_id)
-                ts_size = os.path.getsize(seg_path_ts) if os.path.exists(seg_path_ts) else 0
-                if ts_size > 0:
-                    seg_path_mp4 = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_{segment_num:03d}.mp4")
-                    bg_tasks.append(asyncio.create_task(_remux_and_upload(seg_path_ts, seg_path_mp4, segment_num, is_final=True)))
-                    uploaded_segments.append(segment_num)
+                # Concat all parts and upload
+                total_size = _get_total_parts_size(part_files)
+                if total_size > 0:
+                    segment_num += 1
+                    seg_ts = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_{segment_num:03d}.ts")
+                    seg_mp4 = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_{segment_num:03d}.mp4")
+                    if await _concat_parts(part_files, seg_ts):
+                        bg_tasks.append(asyncio.create_task(_remux_and_upload(seg_ts, seg_mp4, segment_num, is_final=True)))
+                        uploaded_segments.append(segment_num)
+                    part_files = []
                 break
 
             # Check from-start
@@ -716,53 +781,66 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                 asyncio.create_task(_download_from_start())
                 await live_status(f"\U0001f534 Recording: {channel_name}\n⏪ Downloading from start in background...")
 
-            # Check file size — segment when >= 2GB
-            try:
-                file_size = os.path.getsize(seg_path_ts) if os.path.exists(seg_path_ts) else 0
-            except OSError:
-                file_size = 0
+            # Check total accumulated size
+            total_size = _get_total_parts_size(part_files)
 
-            if file_size >= SEGMENT_SIZE_BYTES:
-                logger.info(f"[LIVE:{task_id}] Size limit {file_size/(1024*1024):.1f}MB — starting new segment FIRST")
+            if total_size >= SEGMENT_SIZE_BYTES:
+                logger.info(f"[LIVE:{task_id}] Size limit {total_size/(1024*1024):.1f}MB — segmenting")
 
-                # 1. Start new segment BEFORE killing old one (zero gap)
-                next_seg_num = segment_num + 1
-                next_seg_ts = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_{next_seg_num:03d}.ts")
-                new_process, new_proxy = await _start_recording(next_seg_ts, proxy_list)
+                # 1. Start new part BEFORE killing old one (zero gap)
+                part_num += 1
+                next_part = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_p{part_num:03d}.ts")
+                new_process, new_proxy = await _start_recording(next_part, proxy_list)
 
-                # 2. Now kill old process
+                # 2. Kill old process
                 await _kill_process(process, task_id)
 
-                # 3. Send old segment to background remux/upload
-                seg_path_mp4 = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_{segment_num:03d}.mp4")
-                bg_tasks.append(asyncio.create_task(_remux_and_upload(seg_path_ts, seg_path_mp4, segment_num)))
-                uploaded_segments.append(segment_num)
+                # 3. Concat current parts into segment, send to background upload
+                segment_num += 1
+                seg_ts = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_{segment_num:03d}.ts")
+                seg_mp4 = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_{segment_num:03d}.mp4")
+                if await _concat_parts(part_files, seg_ts):
+                    bg_tasks.append(asyncio.create_task(_remux_and_upload(seg_ts, seg_mp4, segment_num)))
+                    uploaded_segments.append(segment_num)
 
-                # 4. Switch to new segment
+                # 4. Reset parts for next segment
+                part_files = [next_part]
+                current_part = next_part
+
                 if new_process is None:
                     logger.error(f"[LIVE:{task_id}] Failed to start next segment, ending")
                     break
-                segment_num = next_seg_num
-                seg_path_ts = next_seg_ts
                 process = new_process
                 used_proxy = new_proxy
-                await live_status(f"\U0001f534 Recording: {channel_name} (Part {segment_num})")
+                await live_status(f"\U0001f534 Recording: {channel_name} (Part {segment_num + 1})")
                 poll_count = 0
                 continue
 
             poll_count += 1
             if poll_count % 10 == 0:
-                size_mb = file_size / (1024*1024)
-                logger.info(f"[LIVE:{task_id}] Recording size={size_mb:.1f}MB polls={poll_count}")
-                await live_status(f"\U0001f534 Recording: {channel_name} ({size_mb:.0f}MB)")
+                total_mb = total_size / (1024*1024)
+                logger.info(f"[LIVE:{task_id}] Recording total={total_mb:.1f}MB parts={len(part_files)} polls={poll_count}")
+                await live_status(f"\U0001f534 Recording: {channel_name} ({total_mb:.0f}MB)")
 
             await asyncio.sleep(3)
 
-        # Wait for all background remux/upload tasks to finish
+        # Upload remaining parts if any
+        if part_files:
+            total_size = _get_total_parts_size(part_files)
+            if total_size > 0:
+                segment_num += 1
+                seg_ts = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_{segment_num:03d}.ts")
+                seg_mp4 = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_{segment_num:03d}.mp4")
+                if await _concat_parts(part_files, seg_ts):
+                    bg_tasks.append(asyncio.create_task(_remux_and_upload(seg_ts, seg_mp4, segment_num, is_final=True)))
+                    uploaded_segments.append(segment_num)
+
+        # Wait for all background tasks
         if bg_tasks:
             logger.info(f"[LIVE:{task_id}] Waiting for {len(bg_tasks)} background tasks...")
             await update_status_msg(f"⬆️ Uploading {len(bg_tasks)} segment(s)...", force=True)
             await asyncio.gather(*bg_tasks, return_exceptions=True)
+            bg_tasks.clear()
 
         logger.info(f"[LIVE:{task_id}] COMPLETE. Segments: {len(uploaded_segments)}")
         if status_msg:
@@ -777,6 +855,8 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
             await update_status_msg(f"\U0001f525 Live recording error: {e}", force=True)
         except Exception as e2:
             logger.error(f"[LIVE:{task_id}] Could not send error msg: {e2}", exc_info=True)
+    finally:
+        gc.collect()
 
 
 def _cleanup_live_files(task_id):
