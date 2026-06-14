@@ -366,7 +366,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
             '--no-part',
             '--no-check-certificates',
             '--no-playlist',
-            '--format', 'best[height<=1080]/best',
+            '--format', 'best',
             '--hls-use-mpegts',
             '--live-from-start',
             '--ffmpeg-location', get_ffmpeg_command(),
@@ -430,7 +430,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
             stderr_str = stderr_out.decode(errors='replace')
             logger.warning(f"[LIVE:{bg_id}] Failed proxy={proxy} rc={proc.returncode}: {stderr_str[:500]}")
 
-            if 'not available' in stderr_str.lower() or 'requested format' in stderr_str.lower():
+            if 'does not support --live-from-start' in stderr_str.lower() or 'live event will begin' in stderr_str.lower():
                 logger.info(f"[LIVE:{bg_id}] No DVR/from-start support")
                 try:
                     await tg_retry(
