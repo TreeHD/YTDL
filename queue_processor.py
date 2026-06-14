@@ -598,9 +598,9 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
             cmd = _build_ffmpeg_cmd(stream_url, seg_path_ts, extract_proxy)
             logger.info(f"[LIVE:{task_id}] ffmpeg cmd: {' '.join(cmd[:6])}... -i <stream> ... {seg_path_ts}")
 
-            # Set proxy env for ffmpeg if needed
+            # Set proxy env for ffmpeg — only HTTP(S) proxies work, not SOCKS5
             env = os.environ.copy()
-            if extract_proxy:
+            if extract_proxy and extract_proxy.startswith('http'):
                 env['http_proxy'] = extract_proxy
                 env['https_proxy'] = extract_proxy
 
@@ -753,9 +753,23 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                 break
 
             if not size_limit_hit and process.returncode != 0:
-                # Stream ended (ffmpeg exited), don't retry
-                logger.info(f"[LIVE:{task_id}] Stream ended (ffmpeg exited), finishing")
-                break
+                # ffmpeg exited unexpectedly (token expired, network error)
+                # Check if stream is still live by trying to extract a fresh URL
+                ts_size_check = os.path.getsize(seg_path_ts) if os.path.exists(seg_path_ts) else 0
+                if ts_size_check == 0 and not uploaded_segments:
+                    # No data at all — stream likely not available
+                    logger.info(f"[LIVE:{task_id}] Stream ended (no data recorded), finishing")
+                    break
+                # Try fresh URL — if extraction fails, stream is truly over
+                logger.info(f"[LIVE:{task_id}] ffmpeg exited mid-stream, will retry with fresh URL")
+                await asyncio.sleep(3)
+                test_url, test_status = await _extract_stream_url(url, proxy_list)
+                if not test_url:
+                    logger.info(f"[LIVE:{task_id}] Stream no longer available (status={test_status}), finishing")
+                    break
+                # Stream still live — continue to next segment with fresh URL
+                logger.info(f"[LIVE:{task_id}] Stream still live, continuing recording")
+                await live_status(f"\U0001f534 Reconnecting: {channel_name}")
 
             if size_limit_hit:
                 await live_status(f"\U0001f534 Recording: {channel_name} — Segment {segment_num} uploaded")
