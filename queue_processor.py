@@ -313,55 +313,9 @@ async def _kill_process(process, task_id):
     except Exception as e:
         logger.error(f"[LIVE:{task_id}] _kill_process error: {e}", exc_info=True)
 
-async def _extract_stream_url(url, proxy_list):
-    """Use yt-dlp to extract the direct stream URL (handles auth, cookies, geo)."""
-    for proxy in proxy_list:
-        cmd = [
-            'yt-dlp',
-            '--format', 'best[height<=1080]/best',
-            '--no-check-certificates',
-            '--no-playlist',
-            '--print', 'urls',
-            '--socket-timeout', '15',
-        ]
-        cookie_file = get_cookie_file()
-        if cookie_file:
-            cmd += ['--cookies', cookie_file]
-        if proxy:
-            cmd += ['--proxy', proxy]
-        cmd.append(url)
-
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-            if proc.returncode == 0:
-                stream_url = stdout.decode().strip().split('\n')[0]
-                if stream_url:
-                    logger.info(f"[LIVE] Extracted stream URL via proxy={proxy}: {stream_url[:100]}...")
-                    return stream_url, proxy
-            else:
-                stderr_str = stderr.decode(errors='replace')
-                logger.warning(f"[LIVE] yt-dlp extract failed proxy={proxy} rc={proc.returncode}: {stderr_str[:300]}")
-                if 'is not currently live' in stderr_str or 'live event will begin' in stderr_str:
-                    return None, 'not_live'
-                if 'not available in your country' in stderr_str:
-                    continue
-        except asyncio.TimeoutError:
-            logger.warning(f"[LIVE] yt-dlp extract timed out proxy={proxy}")
-            continue
-        except Exception as e:
-            logger.error(f"[LIVE] yt-dlp extract error: {e}")
-            continue
-    return None, None
-
-
 async def process_live_stream(application, chat_id, url, message_id, status_msg, task_id, update_status_msg, channel_name):
-    """Record live stream: yt-dlp extracts URL, ffmpeg records directly to mpegts.
-    Default: record from now. Button to download from start in background."""
+    """Record live stream using yt-dlp with forced HLS (iOS client).
+    HLS writes continuously via --hls-use-mpegts, solving the DASH fragment problem."""
     SEGMENT_SIZE_BYTES = 1900 * 1024 * 1024  # 1.9GB per segment
     logger.info(f"[LIVE:{task_id}] START url={url}, chat_id={chat_id}, channel={channel_name}")
 
@@ -379,7 +333,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
         nonlocal status_msg
         try:
             keyboard = _make_keyboard()
-            logger.info(f"[LIVE:{task_id}] live_status: '{text}', has_msg={status_msg is not None}")
+            logger.info(f"[LIVE:{task_id}] live_status: '{text}'")
             if status_msg:
                 if status_msg.text != text:
                     await tg_retry(status_msg.edit_text, text, reply_markup=keyboard)
@@ -388,39 +342,50 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                     application.bot.send_message,
                     chat_id=chat_id, text=text, reply_to_message_id=message_id, reply_markup=keyboard
                 )
-                logger.info(f"[LIVE:{task_id}] Sent new status msg_id={status_msg.message_id if status_msg else None}")
         except Exception as e:
             logger.error(f"[LIVE:{task_id}] live_status failed: {e}", exc_info=True)
 
-    def _build_ffmpeg_cmd(stream_url, output_path, proxy=None):
-        """Build ffmpeg command for direct stream recording."""
-        cmd = [get_ffmpeg_command(), '-y']
-        # Reconnect options for HLS/DASH streams
-        cmd += ['-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5']
-        # Proxy via environment (ffmpeg uses http_proxy for HTTP streams)
-        # Input
-        cmd += ['-i', stream_url]
-        # Copy codecs, output as mpegts (always valid when truncated)
-        cmd += ['-c', 'copy', '-f', 'mpegts', output_path]
-        return cmd
-
-    def _build_ytdlp_cmd(output_path, proxy=None, from_start=False):
-        """yt-dlp command for background from-start download."""
+    def _build_record_cmd(output_path, proxy=None):
+        """yt-dlp command for live recording (from now) using HLS via iOS client."""
         cmd = [
             'yt-dlp',
             '--no-part',
+            '--no-check-certificates',
+            '--no-playlist',
             '--format', 'best[height<=1080]/best',
+            '--extractor-args', 'youtube:player_client=ios',
             '--hls-use-mpegts',
             '--ffmpeg-location', get_ffmpeg_command(),
             '--socket-timeout', '30',
             '--retries', '10',
             '--fragment-retries', '10',
-            '--no-check-certificates',
-            '--no-playlist',
             '-o', output_path,
         ]
-        if from_start:
-            cmd.append('--live-from-start')
+        cookie_file = get_cookie_file()
+        if cookie_file:
+            cmd += ['--cookies', cookie_file]
+        if proxy:
+            cmd += ['--proxy', proxy]
+        cmd.append(url)
+        return cmd
+
+    def _build_fromstart_cmd(output_path, proxy=None):
+        """yt-dlp command for background from-start download."""
+        cmd = [
+            'yt-dlp',
+            '--no-part',
+            '--no-check-certificates',
+            '--no-playlist',
+            '--format', 'best[height<=1080]/best',
+            '--extractor-args', 'youtube:player_client=ios',
+            '--hls-use-mpegts',
+            '--live-from-start',
+            '--ffmpeg-location', get_ffmpeg_command(),
+            '--socket-timeout', '30',
+            '--retries', '10',
+            '--fragment-retries', '10',
+            '-o', output_path,
+        ]
         cookie_file = get_cookie_file()
         if cookie_file:
             cmd += ['--cookies', cookie_file]
@@ -435,77 +400,54 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
         logger.info(f"[LIVE:{bg_id}] Background from-start download starting")
         proxy_list = get_proxy_list()
 
-        seg_num = 0
-        while True:
-            seg_num += 1
-            bg_ts = os.path.join(DOWNLOAD_DIR, f"live_{bg_id}_{seg_num:03d}.ts")
-            bg_mp4 = os.path.join(DOWNLOAD_DIR, f"live_{bg_id}_{seg_num:03d}.mp4")
+        bg_ts = os.path.join(DOWNLOAD_DIR, f"live_{bg_id}_001.ts")
+        bg_mp4 = os.path.join(DOWNLOAD_DIR, f"live_{bg_id}_001.mp4")
 
-            success = False
-            for proxy in proxy_list:
-                cmd = _build_ytdlp_cmd(bg_ts, proxy, from_start=True)
-                logger.info(f"[LIVE:{bg_id}] cmd: {' '.join(cmd)}")
+        success = False
+        for proxy in proxy_list:
+            cmd = _build_fromstart_cmd(bg_ts, proxy)
+            logger.info(f"[LIVE:{bg_id}] cmd: {' '.join(cmd[:8])}...")
 
-                try:
-                    proc = await asyncio.create_subprocess_exec(
-                        *cmd,
-                        stdout=asyncio.subprocess.DEVNULL,
-                        stderr=asyncio.subprocess.PIPE,
-                    )
-                    logger.info(f"[LIVE:{bg_id}] pid={proc.pid}")
-                except Exception as e:
-                    logger.error(f"[LIVE:{bg_id}] Spawn failed: {e}", exc_info=True)
-                    continue
-
-                # Monitor for task cancel (no size limit for from-start, it ends naturally)
-                while True:
-                    if proc.returncode is not None:
-                        break
-                    if task_id in cancelled_tasks:
-                        await _kill_process(proc, bg_id)
-                        _cleanup_live_files(bg_id)
-                        logger.info(f"[LIVE:{bg_id}] Cancelled")
-                        return
-                    await asyncio.sleep(5)
-
-                if proc.returncode == 0:
-                    success = True
-                    break
-
-                stderr_out = b''
-                try:
-                    stderr_out = await asyncio.wait_for(proc.stderr.read(), timeout=5)
-                except Exception:
-                    pass
-                stderr_str = stderr_out.decode(errors='replace')
-                logger.warning(f"[LIVE:{bg_id}] Failed proxy={proxy} rc={proc.returncode}: {stderr_str[:500]}")
-
-                if 'not available' in stderr_str.lower() or 'requested format' in stderr_str.lower():
-                    logger.info(f"[LIVE:{bg_id}] No DVR/from-start support")
-                    try:
-                        await tg_retry(
-                            application.bot.send_message,
-                            chat_id=chat_id,
-                            text="⚠️ This stream doesn't support playback from start (no DVR).",
-                            reply_to_message_id=message_id
-                        )
-                    except Exception:
-                        pass
-                    _cleanup_live_files(bg_id)
-                    return
-
-                if os.path.exists(bg_ts) and os.path.getsize(bg_ts) == 0:
-                    try: os.remove(bg_ts)
-                    except: pass
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                logger.info(f"[LIVE:{bg_id}] pid={proc.pid}")
+            except Exception as e:
+                logger.error(f"[LIVE:{bg_id}] Spawn failed: {e}", exc_info=True)
                 continue
 
-            if not success:
-                logger.error(f"[LIVE:{bg_id}] All proxies failed")
+            while True:
+                if proc.returncode is not None:
+                    break
+                if task_id in cancelled_tasks:
+                    await _kill_process(proc, bg_id)
+                    _cleanup_live_files(bg_id)
+                    logger.info(f"[LIVE:{bg_id}] Cancelled")
+                    return
+                await asyncio.sleep(5)
+
+            if proc.returncode == 0:
+                success = True
+                break
+
+            stderr_out = b''
+            try:
+                stderr_out = await asyncio.wait_for(proc.stderr.read(), timeout=5)
+            except Exception:
+                pass
+            stderr_str = stderr_out.decode(errors='replace')
+            logger.warning(f"[LIVE:{bg_id}] Failed proxy={proxy} rc={proc.returncode}: {stderr_str[:500]}")
+
+            if 'not available' in stderr_str.lower() or 'requested format' in stderr_str.lower():
+                logger.info(f"[LIVE:{bg_id}] No DVR/from-start support")
                 try:
                     await tg_retry(
                         application.bot.send_message,
                         chat_id=chat_id,
-                        text="❌ From-start download failed.",
+                        text="⚠️ This stream doesn't support playback from start (no DVR).",
                         reply_to_message_id=message_id
                     )
                 except Exception:
@@ -513,268 +455,299 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                 _cleanup_live_files(bg_id)
                 return
 
-            # Remux and upload
-            ts_size = os.path.getsize(bg_ts) if os.path.exists(bg_ts) else 0
-            if ts_size > 0:
-                try:
-                    remux = await asyncio.create_subprocess_exec(
+            if os.path.exists(bg_ts) and os.path.getsize(bg_ts) == 0:
+                try: os.remove(bg_ts)
+                except: pass
+            continue
+
+        if not success:
+            logger.error(f"[LIVE:{bg_id}] All proxies failed")
+            try:
+                await tg_retry(
+                    application.bot.send_message,
+                    chat_id=chat_id,
+                    text="❌ From-start download failed.",
+                    reply_to_message_id=message_id
+                )
+            except Exception:
+                pass
+            _cleanup_live_files(bg_id)
+            return
+
+        # Remux and upload
+        ts_size = os.path.getsize(bg_ts) if os.path.exists(bg_ts) else 0
+        if ts_size > 0:
+            try:
+                remux = await asyncio.create_subprocess_exec(
+                    get_ffmpeg_command(), '-y', '-i', bg_ts,
+                    '-c', 'copy', '-movflags', '+faststart', bg_mp4,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await remux.stderr.read()
+                await remux.wait()
+                if remux.returncode != 0:
+                    remux2 = await asyncio.create_subprocess_exec(
                         get_ffmpeg_command(), '-y', '-i', bg_ts,
-                        '-c', 'copy', '-movflags', '+faststart', bg_mp4,
+                        '-c', 'copy', bg_mp4,
                         stdout=asyncio.subprocess.DEVNULL,
-                        stderr=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.DEVNULL,
                     )
-                    await remux.stderr.read()
-                    await remux.wait()
-                    if remux.returncode != 0:
-                        remux2 = await asyncio.create_subprocess_exec(
-                            get_ffmpeg_command(), '-y', '-i', bg_ts,
-                            '-c', 'copy', bg_mp4,
-                            stdout=asyncio.subprocess.DEVNULL,
-                            stderr=asyncio.subprocess.DEVNULL,
-                        )
-                        await remux2.wait()
-                    if os.path.exists(bg_mp4) and os.path.getsize(bg_mp4) > 0:
-                        try: os.remove(bg_ts)
-                        except: pass
-                    else:
-                        logger.error(f"[LIVE:{bg_id}] Remux produced no output")
-                        try: os.remove(bg_ts)
-                        except: pass
-                        break
-                except Exception as e:
-                    logger.error(f"[LIVE:{bg_id}] Remux error: {e}", exc_info=True)
+                    await remux2.wait()
+                if os.path.exists(bg_mp4) and os.path.getsize(bg_mp4) > 0:
                     try: os.remove(bg_ts)
                     except: pass
-                    break
+                else:
+                    logger.error(f"[LIVE:{bg_id}] Remux produced no output")
+                    try: os.remove(bg_ts)
+                    except: pass
+                    return
+            except Exception as e:
+                logger.error(f"[LIVE:{bg_id}] Remux error: {e}", exc_info=True)
+                try: os.remove(bg_ts)
+                except: pass
+                return
 
-                try:
-                    title = f"⏪ {channel_name} - From Start"
-                    logger.info(f"[LIVE:{bg_id}] Uploading: {title}")
-                    await handle_upload(application, chat_id, bg_mp4, title, url, False, update_status_msg, channel_name, message_id)
-                    logger.info(f"[LIVE:{bg_id}] Upload done")
-                except Exception as e:
-                    logger.error(f"[LIVE:{bg_id}] Upload failed: {e}", exc_info=True)
-
-            break  # from-start downloads once (the whole DVR content)
+            try:
+                title = f"⏪ {channel_name} - From Start"
+                logger.info(f"[LIVE:{bg_id}] Uploading: {title}")
+                await handle_upload(application, chat_id, bg_mp4, title, url, False, update_status_msg, channel_name, message_id)
+                logger.info(f"[LIVE:{bg_id}] Upload done")
+            except Exception as e:
+                logger.error(f"[LIVE:{bg_id}] Upload failed: {e}", exc_info=True)
 
         logger.info(f"[LIVE:{bg_id}] Background from-start download complete")
 
+    async def _remux_and_upload(ts_path, mp4_path, seg_num, is_final=False):
+        """Background task: remux .ts to .mp4 and upload. No interruption to recording."""
+        try:
+            ts_size = os.path.getsize(ts_path) if os.path.exists(ts_path) else 0
+            if ts_size == 0:
+                try: os.remove(ts_path)
+                except: pass
+                return
+
+            logger.info(f"[LIVE:{task_id}] BG remux seg {seg_num}: {ts_size/(1024*1024):.1f}MB")
+            remux = await asyncio.create_subprocess_exec(
+                get_ffmpeg_command(), '-y', '-i', ts_path,
+                '-c', 'copy', '-movflags', '+faststart', mp4_path,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await remux.stderr.read()
+            await remux.wait()
+            if remux.returncode != 0:
+                remux2 = await asyncio.create_subprocess_exec(
+                    get_ffmpeg_command(), '-y', '-i', ts_path,
+                    '-c', 'copy', mp4_path,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await remux2.stderr.read()
+                await remux2.wait()
+                if remux2.returncode != 0:
+                    logger.error(f"[LIVE:{task_id}] BG remux seg {seg_num} failed completely")
+                    try: os.remove(ts_path)
+                    except: pass
+                    return
+            try: os.remove(ts_path)
+            except: pass
+
+            upload_size = os.path.getsize(mp4_path) if os.path.exists(mp4_path) else 0
+            if upload_size > 0:
+                title = f"\U0001f534 {channel_name} - LIVE Part {seg_num}"
+                if is_final:
+                    title += " (End)"
+                logger.info(f"[LIVE:{task_id}] BG uploading seg {seg_num}: {upload_size/(1024*1024):.1f}MB")
+                await handle_upload(application, chat_id, mp4_path, title, url, False, None, channel_name, message_id)
+                logger.info(f"[LIVE:{task_id}] BG upload done seg {seg_num}")
+            else:
+                logger.warning(f"[LIVE:{task_id}] BG remux produced empty file seg {seg_num}")
+        except Exception as e:
+            logger.error(f"[LIVE:{task_id}] BG remux/upload seg {seg_num} error: {e}", exc_info=True)
+
+    async def _start_recording(seg_ts_path, proxy_list):
+        """Start a yt-dlp recording process, trying each proxy. Returns (process, proxy) or (None, None)."""
+        for proxy in proxy_list:
+            cmd = _build_record_cmd(seg_ts_path, proxy)
+            logger.info(f"[LIVE:{task_id}] yt-dlp cmd (proxy={proxy}): {' '.join(cmd[:10])}...")
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                logger.info(f"[LIVE:{task_id}] yt-dlp pid={proc.pid} proxy={proxy}")
+                return proc, proxy
+            except Exception as e:
+                logger.error(f"[LIVE:{task_id}] Spawn failed proxy={proxy}: {e}")
+                continue
+        return None, None
+
     try:
-        await live_status(f"\U0001f534 Getting stream URL: {channel_name}")
+        await live_status(f"\U0001f534 Starting live recording: {channel_name}")
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
         proxy_list = get_proxy_list()
         logger.info(f"[LIVE:{task_id}] Proxies: {proxy_list}")
         segment_num = 0
         uploaded_segments = []
+        consecutive_failures = 0
+        bg_tasks = []
+
+        # Start first segment
+        segment_num = 1
+        seg_path_ts = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_{segment_num:03d}.ts")
+        process, used_proxy = await _start_recording(seg_path_ts, proxy_list)
+
+        if process is None:
+            await update_status_msg("❌ Failed to start recording. All proxies failed.", force=True)
+            _cleanup_live_files(task_id)
+            return
+
+        await live_status(f"\U0001f534 Recording live stream: {channel_name}")
+        poll_count = 0
 
         while True:
+            if process.returncode is not None:
+                logger.info(f"[LIVE:{task_id}] yt-dlp exited rc={process.returncode}")
+
+                # Check if error or natural end
+                if process.returncode != 0:
+                    stderr_out = b''
+                    try:
+                        stderr_out = await asyncio.wait_for(process.stderr.read(), timeout=5)
+                    except Exception:
+                        pass
+                    stderr_str = stderr_out.decode(errors='replace')
+                    logger.warning(f"[LIVE:{task_id}] yt-dlp error: {stderr_str[-500:]}")
+
+                    ts_size = os.path.getsize(seg_path_ts) if os.path.exists(seg_path_ts) else 0
+
+                    if 'is not currently live' in stderr_str or 'live event will begin' in stderr_str:
+                        if ts_size == 0 and not uploaded_segments:
+                            await update_status_msg("❌ Stream is not currently live.", force=True)
+                            _cleanup_live_files(task_id)
+                            return
+
+                    if ts_size == 0:
+                        consecutive_failures += 1
+                        if consecutive_failures >= 3:
+                            if not uploaded_segments:
+                                await update_status_msg(f"❌ Recording failed after {consecutive_failures} attempts.", force=True)
+                            logger.error(f"[LIVE:{task_id}] {consecutive_failures} consecutive failures, giving up")
+                            break
+                        logger.info(f"[LIVE:{task_id}] No data, retry {consecutive_failures}/3 in 5s")
+                        await asyncio.sleep(5)
+                        process, used_proxy = await _start_recording(seg_path_ts, proxy_list)
+                        if process is None:
+                            break
+                        continue
+                    else:
+                        consecutive_failures = 0
+                        # Had data but crashed — remux/upload this segment, start new one
+                        seg_path_mp4 = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_{segment_num:03d}.mp4")
+                        bg_tasks.append(asyncio.create_task(_remux_and_upload(seg_path_ts, seg_path_mp4, segment_num)))
+                        uploaded_segments.append(segment_num)
+
+                        # Start next segment immediately
+                        segment_num += 1
+                        seg_path_ts = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_{segment_num:03d}.ts")
+                        await live_status(f"\U0001f534 Reconnecting: {channel_name}")
+                        await asyncio.sleep(3)
+                        process, used_proxy = await _start_recording(seg_path_ts, proxy_list)
+                        if process is None:
+                            break
+                        await live_status(f"\U0001f534 Recording live stream: {channel_name}")
+                        continue
+                else:
+                    # rc=0: stream ended naturally
+                    ts_size = os.path.getsize(seg_path_ts) if os.path.exists(seg_path_ts) else 0
+                    if ts_size > 0:
+                        seg_path_mp4 = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_{segment_num:03d}.mp4")
+                        bg_tasks.append(asyncio.create_task(_remux_and_upload(seg_path_ts, seg_path_mp4, segment_num, is_final=True)))
+                        uploaded_segments.append(segment_num)
+                    logger.info(f"[LIVE:{task_id}] Stream ended naturally")
+                    break
+
+            # Check cancel
             if task_id in cancelled_tasks:
-                logger.info(f"[LIVE:{task_id}] Cancelled before segment start")
+                logger.info(f"[LIVE:{task_id}] Cancel signal")
+                await _kill_process(process, task_id)
                 cancelled_tasks.discard(task_id)
                 await update_status_msg("❌ Live recording cancelled.", force=True)
                 _cleanup_live_files(task_id)
                 return
 
-            # Extract fresh stream URL for each segment (tokens expire)
-            stream_url, extract_proxy = await _extract_stream_url(url, proxy_list)
-            if not stream_url:
-                if extract_proxy == 'not_live':
-                    if not uploaded_segments:
-                        await update_status_msg("❌ Stream is not currently live.", force=True)
-                    _cleanup_live_files(task_id)
-                    return
-                if not uploaded_segments:
-                    await update_status_msg("❌ Could not get stream URL. All proxies failed.", force=True)
-                _cleanup_live_files(task_id)
-                return
-
-            segment_num += 1
-            seg_path_ts = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_{segment_num:03d}.ts")
-            seg_path = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_{segment_num:03d}.mp4")
-            logger.info(f"[LIVE:{task_id}] Segment {segment_num}: ts={seg_path_ts}")
-
-            # Build ffmpeg command
-            cmd = _build_ffmpeg_cmd(stream_url, seg_path_ts, extract_proxy)
-            logger.info(f"[LIVE:{task_id}] ffmpeg cmd: {' '.join(cmd[:6])}... -i <stream> ... {seg_path_ts}")
-
-            # Set proxy env for ffmpeg — only HTTP(S) proxies work, not SOCKS5
-            env = os.environ.copy()
-            if extract_proxy and extract_proxy.startswith('http'):
-                env['http_proxy'] = extract_proxy
-                env['https_proxy'] = extract_proxy
-
-            try:
-                process = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.PIPE,
-                    env=env,
-                )
-                logger.info(f"[LIVE:{task_id}] ffmpeg pid={process.pid}")
-            except Exception as e:
-                logger.error(f"[LIVE:{task_id}] Failed to spawn ffmpeg: {e}", exc_info=True)
-                if not uploaded_segments:
-                    await update_status_msg(f"\U0001f525 Failed to start recording: {e}", force=True)
-                _cleanup_live_files(task_id)
-                return
-
-            await live_status(f"\U0001f534 Recording live stream: {channel_name}")
-
-            user_stopped = False
-            size_limit_hit = False
-            poll_count = 0
-
-            while True:
-                if process.returncode is not None:
-                    logger.info(f"[LIVE:{task_id}] ffmpeg exited rc={process.returncode}")
-                    break
-
-                if task_id in cancelled_tasks:
-                    logger.info(f"[LIVE:{task_id}] Cancel signal")
-                    await _kill_process(process, task_id)
-                    cancelled_tasks.discard(task_id)
-                    await update_status_msg("❌ Live recording cancelled.", force=True)
-                    _cleanup_live_files(task_id)
-                    return
-
-                if task_id in stopped_tasks:
-                    logger.info(f"[LIVE:{task_id}] Stop & Upload signal")
-                    user_stopped = True
-                    await _kill_process(process, task_id)
-                    stopped_tasks.discard(task_id)
-                    break
-
-                if task_id in fromstart_tasks and not fromstart_triggered:
-                    logger.info(f"[LIVE:{task_id}] 'From Start' triggered, spawning background download")
-                    fromstart_triggered = True
-                    fromstart_tasks.discard(task_id)
-                    asyncio.create_task(_download_from_start())
-                    await live_status(f"\U0001f534 Recording: {channel_name}\n⏪ Downloading from start in background...")
-
-                try:
-                    file_size = os.path.getsize(seg_path_ts) if os.path.exists(seg_path_ts) else 0
-                except OSError:
-                    file_size = 0
-
-                if file_size >= SEGMENT_SIZE_BYTES:
-                    logger.info(f"[LIVE:{task_id}] Size limit hit: {file_size/(1024*1024):.1f}MB")
-                    size_limit_hit = True
-                    await _kill_process(process, task_id)
-                    break
-
-                poll_count += 1
-                if poll_count % 10 == 0:
-                    logger.info(f"[LIVE:{task_id}] Recording file_size={file_size/(1024*1024):.1f}MB polls={poll_count}")
-
-                await asyncio.sleep(3)
-
-            # ffmpeg exited or was stopped — check if stream ended with error
-            if process.returncode is not None and process.returncode != 0 and not user_stopped and not size_limit_hit:
-                stderr_out = b''
-                try:
-                    stderr_out = await asyncio.wait_for(process.stderr.read(), timeout=5)
-                except Exception:
-                    pass
-                stderr_str = stderr_out.decode(errors='replace')
-                logger.warning(f"[LIVE:{task_id}] ffmpeg ended rc={process.returncode}: {stderr_str[-500:]}")
-                # If file has content, still try to upload it
+            # Check stop & upload
+            if task_id in stopped_tasks:
+                logger.info(f"[LIVE:{task_id}] Stop & Upload signal")
+                await _kill_process(process, task_id)
+                stopped_tasks.discard(task_id)
                 ts_size = os.path.getsize(seg_path_ts) if os.path.exists(seg_path_ts) else 0
-                if ts_size == 0 and not uploaded_segments:
-                    await update_status_msg(f"❌ Recording failed (ffmpeg exit {process.returncode})", force=True)
-                    _cleanup_live_files(task_id)
-                    return
-                # If has content, fall through to remux/upload, then try next segment
-
-            # Remux .ts -> .mp4
-            ts_exists = os.path.exists(seg_path_ts)
-            ts_size = os.path.getsize(seg_path_ts) if ts_exists else 0
-            logger.info(f"[LIVE:{task_id}] Remux: ts_exists={ts_exists} ts_size={ts_size/(1024*1024):.1f}MB")
-
-            if ts_exists and ts_size > 0:
-                try:
-                    remux = await asyncio.create_subprocess_exec(
-                        get_ffmpeg_command(), '-y', '-i', seg_path_ts,
-                        '-c', 'copy', '-movflags', '+faststart', seg_path,
-                        stdout=asyncio.subprocess.DEVNULL,
-                        stderr=asyncio.subprocess.PIPE,
-                    )
-                    remux_stderr = await remux.stderr.read()
-                    await remux.wait()
-                    logger.info(f"[LIVE:{task_id}] Remux rc={remux.returncode}")
-                    if remux.returncode != 0:
-                        logger.warning(f"[LIVE:{task_id}] Remux faststart failed, retrying: {remux_stderr.decode(errors='replace')[:200]}")
-                        remux2 = await asyncio.create_subprocess_exec(
-                            get_ffmpeg_command(), '-y', '-i', seg_path_ts,
-                            '-c', 'copy', seg_path,
-                            stdout=asyncio.subprocess.DEVNULL,
-                            stderr=asyncio.subprocess.PIPE,
-                        )
-                        await remux2.stderr.read()
-                        await remux2.wait()
-                        if remux2.returncode != 0:
-                            logger.error(f"[LIVE:{task_id}] Remux retry also failed")
-                        else:
-                            try: os.remove(seg_path_ts)
-                            except: pass
-                    else:
-                        try: os.remove(seg_path_ts)
-                        except: pass
-                except Exception as e:
-                    logger.error(f"[LIVE:{task_id}] Remux exception: {e}", exc_info=True)
-            elif ts_exists and ts_size == 0:
-                try: os.remove(seg_path_ts)
-                except: pass
-
-            # Upload
-            upload_exists = os.path.exists(seg_path)
-            upload_size = os.path.getsize(seg_path) if upload_exists else 0
-            logger.info(f"[LIVE:{task_id}] Upload: exists={upload_exists} size={upload_size/(1024*1024):.1f}MB")
-
-            if upload_exists and upload_size > 0:
-                try:
-                    is_final = not size_limit_hit or user_stopped
-                    title = f"\U0001f534 {channel_name} - LIVE Part {segment_num}"
-                    if is_final and (segment_num > 1 or uploaded_segments):
-                        title += " (End)"
-                    await update_status_msg(f"⬆️ Uploading segment {segment_num}...", force=True)
-                    logger.info(f"[LIVE:{task_id}] Uploading: '{title}' size={upload_size/(1024*1024):.1f}MB")
-                    await handle_upload(application, chat_id, seg_path, title, url, False, update_status_msg, channel_name, message_id)
-                    uploaded_segments.append(seg_path)
-                    logger.info(f"[LIVE:{task_id}] Upload done segment {segment_num}")
-                except Exception as e:
-                    logger.error(f"[LIVE:{task_id}] Upload FAILED: {e}", exc_info=True)
-                    await update_status_msg(f"❌ Upload failed: {e}", force=True)
-            else:
-                logger.warning(f"[LIVE:{task_id}] Nothing to upload for segment {segment_num}")
-
-            if user_stopped:
-                logger.info(f"[LIVE:{task_id}] User stopped, finishing")
+                if ts_size > 0:
+                    seg_path_mp4 = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_{segment_num:03d}.mp4")
+                    bg_tasks.append(asyncio.create_task(_remux_and_upload(seg_path_ts, seg_path_mp4, segment_num, is_final=True)))
+                    uploaded_segments.append(segment_num)
                 break
 
-            if not size_limit_hit and process.returncode != 0:
-                # ffmpeg exited unexpectedly (token expired, network error)
-                # Check if stream is still live by trying to extract a fresh URL
-                ts_size_check = os.path.getsize(seg_path_ts) if os.path.exists(seg_path_ts) else 0
-                if ts_size_check == 0 and not uploaded_segments:
-                    # No data at all — stream likely not available
-                    logger.info(f"[LIVE:{task_id}] Stream ended (no data recorded), finishing")
-                    break
-                # Try fresh URL — if extraction fails, stream is truly over
-                logger.info(f"[LIVE:{task_id}] ffmpeg exited mid-stream, will retry with fresh URL")
-                await asyncio.sleep(3)
-                test_url, test_status = await _extract_stream_url(url, proxy_list)
-                if not test_url:
-                    logger.info(f"[LIVE:{task_id}] Stream no longer available (status={test_status}), finishing")
-                    break
-                # Stream still live — continue to next segment with fresh URL
-                logger.info(f"[LIVE:{task_id}] Stream still live, continuing recording")
-                await live_status(f"\U0001f534 Reconnecting: {channel_name}")
+            # Check from-start
+            if task_id in fromstart_tasks and not fromstart_triggered:
+                logger.info(f"[LIVE:{task_id}] 'From Start' triggered")
+                fromstart_triggered = True
+                fromstart_tasks.discard(task_id)
+                asyncio.create_task(_download_from_start())
+                await live_status(f"\U0001f534 Recording: {channel_name}\n⏪ Downloading from start in background...")
 
-            if size_limit_hit:
-                await live_status(f"\U0001f534 Recording: {channel_name} — Segment {segment_num} uploaded")
+            # Check file size — segment when >= 2GB
+            try:
+                file_size = os.path.getsize(seg_path_ts) if os.path.exists(seg_path_ts) else 0
+            except OSError:
+                file_size = 0
 
-        logger.info(f"[LIVE:{task_id}] COMPLETE. Segments uploaded: {len(uploaded_segments)}")
+            if file_size >= SEGMENT_SIZE_BYTES:
+                logger.info(f"[LIVE:{task_id}] Size limit {file_size/(1024*1024):.1f}MB — starting new segment FIRST")
+
+                # 1. Start new segment BEFORE killing old one (zero gap)
+                next_seg_num = segment_num + 1
+                next_seg_ts = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_{next_seg_num:03d}.ts")
+                new_process, new_proxy = await _start_recording(next_seg_ts, proxy_list)
+
+                # 2. Now kill old process
+                await _kill_process(process, task_id)
+
+                # 3. Send old segment to background remux/upload
+                seg_path_mp4 = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_{segment_num:03d}.mp4")
+                bg_tasks.append(asyncio.create_task(_remux_and_upload(seg_path_ts, seg_path_mp4, segment_num)))
+                uploaded_segments.append(segment_num)
+
+                # 4. Switch to new segment
+                if new_process is None:
+                    logger.error(f"[LIVE:{task_id}] Failed to start next segment, ending")
+                    break
+                segment_num = next_seg_num
+                seg_path_ts = next_seg_ts
+                process = new_process
+                used_proxy = new_proxy
+                await live_status(f"\U0001f534 Recording: {channel_name} (Part {segment_num})")
+                poll_count = 0
+                continue
+
+            poll_count += 1
+            if poll_count % 10 == 0:
+                size_mb = file_size / (1024*1024)
+                logger.info(f"[LIVE:{task_id}] Recording size={size_mb:.1f}MB polls={poll_count}")
+                await live_status(f"\U0001f534 Recording: {channel_name} ({size_mb:.0f}MB)")
+
+            await asyncio.sleep(3)
+
+        # Wait for all background remux/upload tasks to finish
+        if bg_tasks:
+            logger.info(f"[LIVE:{task_id}] Waiting for {len(bg_tasks)} background tasks...")
+            await update_status_msg(f"⬆️ Uploading {len(bg_tasks)} segment(s)...", force=True)
+            await asyncio.gather(*bg_tasks, return_exceptions=True)
+
+        logger.info(f"[LIVE:{task_id}] COMPLETE. Segments: {len(uploaded_segments)}")
         if status_msg:
             try: await tg_retry(status_msg.delete)
             except Exception as e:
