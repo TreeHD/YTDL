@@ -346,27 +346,17 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
             logger.error(f"[LIVE:{task_id}] live_status failed: {e}", exc_info=True)
 
     def _build_record_cmd(output_path, proxy=None):
-        """yt-dlp command for live recording (from now)."""
+        """streamlink command for live recording — writes continuously to file."""
         cmd = [
-            'yt-dlp',
-            '--no-part',
-            '--no-check-certificates',
-            '--no-playlist',
-            '--format', 'best[height<=1080]/best',
-            '--extractor-args', 'youtube:player_client=web,mweb,android',
-            '--hls-use-mpegts',
-            '--ffmpeg-location', get_ffmpeg_command(),
-            '--socket-timeout', '30',
-            '--retries', '10',
-            '--fragment-retries', '10',
+            'streamlink',
+            '--force',
+            '--loglevel', 'warning',
+            '--ffmpeg-ffmpeg', get_ffmpeg_command(),
             '-o', output_path,
         ]
-        cookie_file = get_cookie_file()
-        if cookie_file:
-            cmd += ['--cookies', cookie_file]
         if proxy:
-            cmd += ['--proxy', proxy]
-        cmd.append(url)
+            cmd += ['--http-proxy', proxy]
+        cmd += [url, 'best']
         return cmd
 
     def _build_fromstart_cmd(output_path, proxy=None):

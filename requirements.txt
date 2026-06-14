@@ -1,4 +1,5 @@
 yt-dlp==2026.6.9
+streamlink
 python-telegram-bot
 aiohttp
 aiofiles
