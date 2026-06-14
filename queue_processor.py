@@ -346,14 +346,14 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
             logger.error(f"[LIVE:{task_id}] live_status failed: {e}", exc_info=True)
 
     def _build_record_cmd(output_path, proxy=None):
-        """yt-dlp command for live recording (from now) using HLS via iOS client."""
+        """yt-dlp command for live recording (from now)."""
         cmd = [
             'yt-dlp',
             '--no-part',
             '--no-check-certificates',
             '--no-playlist',
             '--format', 'best[height<=1080]/best',
-            '--extractor-args', 'youtube:player_client=ios',
+            '--extractor-args', 'youtube:player_client=web,mweb,android',
             '--hls-use-mpegts',
             '--ffmpeg-location', get_ffmpeg_command(),
             '--socket-timeout', '30',
@@ -377,7 +377,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
             '--no-check-certificates',
             '--no-playlist',
             '--format', 'best[height<=1080]/best',
-            '--extractor-args', 'youtube:player_client=ios',
+            '--extractor-args', 'youtube:player_client=web,mweb,android',
             '--hls-use-mpegts',
             '--live-from-start',
             '--ffmpeg-location', get_ffmpeg_command(),
