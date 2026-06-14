@@ -367,7 +367,6 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
             '--no-check-certificates',
             '--no-playlist',
             '--format', 'best[height<=1080]/best',
-            '--extractor-args', 'youtube:player_client=web,mweb,android',
             '--hls-use-mpegts',
             '--live-from-start',
             '--ffmpeg-location', get_ffmpeg_command(),
@@ -651,14 +650,43 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                         await live_status(f"\U0001f534 Recording live stream: {channel_name}")
                         continue
                 else:
-                    # rc=0: stream ended naturally
+                    # rc=0: streamlink exited cleanly, but stream might still be live
+                    # Save current segment, then try to restart
                     ts_size = os.path.getsize(seg_path_ts) if os.path.exists(seg_path_ts) else 0
                     if ts_size > 0:
                         seg_path_mp4 = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_{segment_num:03d}.mp4")
-                        bg_tasks.append(asyncio.create_task(_remux_and_upload(seg_path_ts, seg_path_mp4, segment_num, is_final=True)))
+                        bg_tasks.append(asyncio.create_task(_remux_and_upload(seg_path_ts, seg_path_mp4, segment_num)))
                         uploaded_segments.append(segment_num)
-                    logger.info(f"[LIVE:{task_id}] Stream ended naturally")
-                    break
+
+                    # Try to restart — if streamlink exits immediately again with no data, stream is truly over
+                    logger.info(f"[LIVE:{task_id}] streamlink exited rc=0, verifying if stream still live...")
+                    await asyncio.sleep(3)
+                    segment_num += 1
+                    seg_path_ts = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_{segment_num:03d}.ts")
+                    process, used_proxy = await _start_recording(seg_path_ts, proxy_list)
+                    if process is None:
+                        logger.info(f"[LIVE:{task_id}] Cannot restart, stream ended")
+                        break
+                    # Wait up to 15s to see if it produces data or exits
+                    for _ in range(5):
+                        await asyncio.sleep(3)
+                        if process.returncode is not None:
+                            break
+                        check_size = os.path.getsize(seg_path_ts) if os.path.exists(seg_path_ts) else 0
+                        if check_size > 0:
+                            break
+                    if process.returncode is not None:
+                        check_size = os.path.getsize(seg_path_ts) if os.path.exists(seg_path_ts) else 0
+                        if check_size == 0:
+                            logger.info(f"[LIVE:{task_id}] Restart produced no data, stream truly ended")
+                            try: os.remove(seg_path_ts)
+                            except: pass
+                            break
+                    # Stream is still live — continue recording this new segment
+                    logger.info(f"[LIVE:{task_id}] Stream still live, continuing with segment {segment_num}")
+                    await live_status(f"\U0001f534 Recording: {channel_name} (Part {segment_num})")
+                    poll_count = 0
+                    continue
 
             # Check cancel
             if task_id in cancelled_tasks:
