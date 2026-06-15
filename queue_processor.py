@@ -592,7 +592,9 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
             logger.error(f"[LIVE:{task_id}] BG remux/upload seg {seg_num} error: {e}", exc_info=True)
 
     async def _start_recording(part_path, proxy_list):
-        """Start a streamlink recording process, trying each proxy. Returns (process, proxy) or (None, None)."""
+        """Start a streamlink recording process, trying each proxy.
+        Waits a few seconds to verify the process doesn't die immediately.
+        Returns (process, proxy) or (None, None)."""
         for proxy in proxy_list:
             cmd = _build_record_cmd(part_path, proxy)
             logger.info(f"[LIVE:{task_id}] streamlink cmd (proxy={proxy}): {' '.join(cmd[:10])}...")
@@ -603,10 +605,36 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                     stderr=asyncio.subprocess.PIPE,
                 )
                 logger.info(f"[LIVE:{task_id}] streamlink pid={proc.pid} proxy={proxy}")
-                return proc, proxy
             except Exception as e:
                 logger.error(f"[LIVE:{task_id}] Spawn failed proxy={proxy}: {e}")
                 continue
+
+            # Wait up to 5s to verify process doesn't die immediately
+            for _ in range(5):
+                await asyncio.sleep(1)
+                if proc.returncode is not None:
+                    break
+                file_size = os.path.getsize(part_path) if os.path.exists(part_path) else 0
+                if file_size > 0:
+                    return proc, proxy
+
+            if proc.returncode is not None:
+                # Process died — try next proxy
+                stderr_out = b''
+                try:
+                    stderr_out = await asyncio.wait_for(proc.stderr.read(), timeout=3)
+                except Exception:
+                    pass
+                logger.warning(f"[LIVE:{task_id}] streamlink died immediately with proxy={proxy} rc={proc.returncode}: {stderr_out.decode(errors='replace')[:200]}")
+                # Clean up empty file before trying next proxy
+                if os.path.exists(part_path) and os.path.getsize(part_path) == 0:
+                    try: os.remove(part_path)
+                    except: pass
+                continue
+
+            # Process still running after 5s — good
+            return proc, proxy
+
         return None, None
 
     def _get_total_parts_size(part_files):
