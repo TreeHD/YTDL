@@ -235,7 +235,7 @@ def download_content(url, progress_callback=None, audio_only=False, audio_format
         else:
             ydl_opts = {
                 'outtmpl': f'{DOWNLOAD_DIR}/%(title).80s [%(id)s].%(ext)s',
-                'format': f'bestvideo[height<={max_height}]+bestaudio/best[height<={max_height}]/best',
+                'format': f'bestvideo[height<={max_height}][vcodec!~=av01]+bestaudio/best[height<={max_height}]/best',
                 'merge_output_format': 'mp4',
                 'noplaylist': True,
                 'quiet': True,
