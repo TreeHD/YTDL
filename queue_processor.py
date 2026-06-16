@@ -400,7 +400,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                 proc = await asyncio.create_subprocess_exec(
                     *cmd,
                     stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
                 )
                 logger.info(f"[LIVE:{bg_id}] pid={proc.pid}")
             except Exception as e:
@@ -421,27 +421,11 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                 success = True
                 break
 
-            stderr_out = b''
-            try:
-                stderr_out = await asyncio.wait_for(proc.stderr.read(), timeout=5)
-            except Exception:
-                pass
-            stderr_str = stderr_out.decode(errors='replace')
-            logger.warning(f"[LIVE:{bg_id}] Failed proxy={proxy} rc={proc.returncode}: {stderr_str[:500]}")
+            logger.warning(f"[LIVE:{bg_id}] Failed proxy={proxy} rc={proc.returncode}")
 
-            if 'does not support --live-from-start' in stderr_str.lower() or 'live event will begin' in stderr_str.lower():
-                logger.info(f"[LIVE:{bg_id}] No DVR/from-start support")
-                try:
-                    await tg_retry(
-                        application.bot.send_message,
-                        chat_id=chat_id,
-                        text="⚠️ This stream doesn't support playback from start (no DVR).",
-                        reply_to_message_id=message_id
-                    )
-                except Exception:
-                    pass
-                _cleanup_live_files(bg_id)
-                return
+            if os.path.exists(bg_ts) and os.path.getsize(bg_ts) == 0:
+                try: os.remove(bg_ts)
+                except: pass
 
             if os.path.exists(bg_ts) and os.path.getsize(bg_ts) == 0:
                 try: os.remove(bg_ts)
@@ -616,26 +600,36 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                     break
                 file_size = os.path.getsize(part_path) if os.path.exists(part_path) else 0
                 if file_size > 0:
-                    return proc, proxy
+                    break
 
             if proc.returncode is not None:
-                # Process died — try next proxy
+                # Process died — read stderr for diagnosis, try next proxy
                 stderr_out = b''
                 try:
                     stderr_out = await asyncio.wait_for(proc.stderr.read(), timeout=3)
                 except Exception:
                     pass
                 logger.warning(f"[LIVE:{task_id}] streamlink died immediately with proxy={proxy} rc={proc.returncode}: {stderr_out.decode(errors='replace')[:200]}")
-                # Clean up empty file before trying next proxy
                 if os.path.exists(part_path) and os.path.getsize(part_path) == 0:
                     try: os.remove(part_path)
                     except: pass
                 continue
 
-            # Process still running after 5s — good
+            # Process survived — drain stderr pipe in background to prevent deadlock
+            asyncio.create_task(_drain_stderr(proc, proxy))
             return proc, proxy
 
         return None, None
+
+    async def _drain_stderr(proc, proxy):
+        """Continuously drain stderr to prevent pipe buffer deadlock."""
+        try:
+            while True:
+                chunk = await proc.stderr.read(4096)
+                if not chunk:
+                    break
+        except Exception:
+            pass
 
     def _get_total_parts_size(part_files):
         """Get total size of all part files."""
@@ -681,21 +675,12 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                 logger.info(f"[LIVE:{task_id}] streamlink exited rc={process.returncode}")
 
                 if process.returncode != 0:
-                    stderr_out = b''
-                    try:
-                        stderr_out = await asyncio.wait_for(process.stderr.read(), timeout=5)
-                    except Exception:
-                        pass
-                    stderr_str = stderr_out.decode(errors='replace')
-                    logger.warning(f"[LIVE:{task_id}] streamlink error: {stderr_str[-500:]}")
-
                     current_size = os.path.getsize(current_part) if os.path.exists(current_part) else 0
+                    logger.warning(f"[LIVE:{task_id}] streamlink error rc={process.returncode}, part_size={current_size}")
 
-                    if 'is not currently live' in stderr_str or 'live event will begin' in stderr_str:
-                        if current_size == 0 and not uploaded_segments and _get_total_parts_size(part_files) == 0:
-                            await update_status_msg("❌ Stream is not currently live.", force=True)
-                            _cleanup_live_files(task_id)
-                            return
+                    if current_size == 0 and not uploaded_segments and _get_total_parts_size(part_files) == 0:
+                        # Nothing recorded at all — might not be live
+                        pass
 
                     if current_size == 0:
                         # Remove empty part from list
