@@ -26,7 +26,7 @@ services:
     ports:
       - "8081:8081"
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8081/ || exit 1"]
+      test: ["CMD-SHELL", "wget -T 3 -S -qO /dev/null http://$(hostname -i):8081/bot 2>&1 | grep -q 'HTTP/'"]
       interval: 30s
       timeout: 10s
       retries: 3
