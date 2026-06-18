@@ -75,7 +75,7 @@ def main():
     application.add_handler(CommandHandler('help', start))
     
     # Quality commands
-    for quality in ['1080', '720', '480', '360', '240']:
+    for quality in ['download', '1080', '720', '480', '360', '240']:
         application.add_handler(CommandHandler(
             quality, 
             lambda update, context: handle_quality_command(update, context, request_queue)

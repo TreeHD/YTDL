@@ -67,6 +67,10 @@ def _apply_cookie(ydl_opts):
     if cookie_file:
         ydl_opts['cookiefile'] = cookie_file
         ydl_opts['remote_components'] = ['ejs:github']
+        os.environ['PATH'] = '/opt/deno/bin:' + os.environ.get('PATH', '')
+    else:
+        if '/opt/deno/bin' in os.environ.get('PATH', ''):
+            os.environ['PATH'] = os.environ['PATH'].replace('/opt/deno/bin:', '')
     ydl_opts['quiet'] = False
     ydl_opts['no_warnings'] = False
     return ydl_opts

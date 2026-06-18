@@ -4,7 +4,14 @@ FROM python:3.14.2-alpine3.23
 WORKDIR /app
 
 # Install system dependencies
-RUN apk update && apk add --no-cache ffmpeg deno nodejs npm
+RUN apk update && apk add --no-cache ffmpeg unzip
+
+# Install deno to non-standard path (only used when cookies are present)
+RUN DENO_VERSION=$(wget -qO- https://dl.deno.land/release-latest.txt) && \
+    ARCH=$(uname -m) && \
+    wget -qO /tmp/deno.zip "https://dl.deno.land/release/${DENO_VERSION}/deno-${ARCH}-unknown-linux-gnu.zip" && \
+    mkdir -p /opt/deno/bin && unzip -o /tmp/deno.zip -d /opt/deno/bin && \
+    chmod +x /opt/deno/bin/deno && rm /tmp/deno.zip
 
 # Install python dependencies
 COPY requirements.txt .

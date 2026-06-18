@@ -151,7 +151,7 @@ async def handle_quality_command(update: Update, context: ContextTypes.DEFAULT_T
         return
     
     command = update.message.text.split()[0].lower()
-    quality_map = {'/1080': 1080, '/720': 720, '/480': 480, '/360': 360, '/240': 240}
+    quality_map = {'/download': 1080, '/1080': 1080, '/720': 720, '/480': 480, '/360': 360, '/240': 240}
     max_height = quality_map.get(command, 1080)
     
     if not context.args:
