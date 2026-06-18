@@ -153,6 +153,12 @@ async def handle_upload(application, chat_id, file_path, title, url, audio_only=
             await update_status_func(error_text, force=True)
         else:
             await application.bot.send_message(chat_id=chat_id, text=error_text)
+        if file_path and os.path.exists(file_path):
+            try: os.remove(file_path)
+            except: pass
+        if thumb_path and os.path.exists(thumb_path):
+            try: os.remove(thumb_path)
+            except: pass
     finally:
         gc.collect()
 
@@ -974,6 +980,9 @@ async def process_playlist_queue(application, playlist_queue):
                     except Exception as e:
                         logger.error(f"Failed for video {i+1}: {e}")
                         await application.bot.send_message(chat_id=chat_id, text=f"⚠️ Skipped {v_title[:30]}: {e}")
+                        for f in glob.glob(os.path.join(DOWNLOAD_DIR, f"*{task_id}*")):
+                            try: os.remove(f)
+                            except: pass
                         continue
 
                 

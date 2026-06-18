@@ -66,7 +66,7 @@ def _apply_cookie(ydl_opts):
     cookie_file = get_cookie_file()
     if cookie_file:
         ydl_opts['cookiefile'] = cookie_file
-    ydl_opts['remote_components'] = ['ejs:github']
+        ydl_opts['remote_components'] = ['ejs:github']
     ydl_opts['quiet'] = False
     ydl_opts['no_warnings'] = False
     return ydl_opts
