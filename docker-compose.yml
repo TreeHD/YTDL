@@ -3,6 +3,8 @@ services:
     image: ghcr.io/treehd/ytdl:latest
     container_name: ytdl-bot
     restart: unless-stopped
+    mem_limit: 512m
+    memswap_limit: 1g
     volumes:
       - ./downloads:/app/downloads
       - ./data:/app/data

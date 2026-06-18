@@ -67,7 +67,9 @@ def _apply_cookie(ydl_opts):
     if cookie_file:
         ydl_opts['cookiefile'] = cookie_file
         ydl_opts['remote_components'] = ['ejs:github']
-        os.environ['PATH'] = '/opt/deno/bin:' + os.environ.get('PATH', '')
+        path = os.environ.get('PATH', '')
+        if '/opt/deno/bin' not in path:
+            os.environ['PATH'] = '/opt/deno/bin:' + path
     else:
         if '/opt/deno/bin' in os.environ.get('PATH', ''):
             os.environ['PATH'] = os.environ['PATH'].replace('/opt/deno/bin:', '')
@@ -250,8 +252,8 @@ def download_content(url, progress_callback=None, audio_only=False, audio_format
                 'ffmpeg_location': get_ffmpeg_command(),
                 'writethumbnail': True,
                 'overwrites': True,
-                'buffer_size': 1024 * 16,
-                'http_chunk_size': 10485760,
+                'buffer_size': 1024 * 8,
+                'http_chunk_size': 2097152,
                 'progress_hooks': [progress_adapter],
                 'postprocessors': [
                     {'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'},

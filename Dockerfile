@@ -30,4 +30,6 @@ COPY subscription.py .
 # Create data directory for SQLite
 RUN mkdir -p /app/data /app/downloads
 
+ENV PYTHONMALLOC=malloc
+
 CMD ["python", "bot.py"]

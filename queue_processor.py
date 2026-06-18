@@ -15,6 +15,10 @@ from handlers import cancelled_tasks, stopped_tasks, fromstart_tasks
 
 logger = logging.getLogger(__name__)
 
+def _free_memory():
+    """Force garbage collection. With PYTHONMALLOC=malloc on musl, freed pages return to OS automatically."""
+    gc.collect()
+
 async def tg_retry(func, *args, **kwargs):
     """Retry Telegram API calls up to 10 times on RateLimit."""
     max_retries = 10
@@ -160,7 +164,7 @@ async def handle_upload(application, chat_id, file_path, title, url, audio_only=
             try: os.remove(thumb_path)
             except: pass
     finally:
-        gc.collect()
+        _free_memory()
 
 async def process_queue(application, request_queue):
     """Main queue processor for single video downloads."""
@@ -301,7 +305,7 @@ async def process_queue(application, request_queue):
             await update_status_msg(f"🔥 Error: {e}", force=True)
         finally:
             request_queue.task_done()
-            gc.collect()
+            _free_memory()
 
 async def _kill_process(process, task_id):
     """Terminate process, wait with timeout, kill if stuck."""
@@ -875,7 +879,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
             logger.error(f"[LIVE:{task_id}] Could not send error msg: {e2}", exc_info=True)
     finally:
         _cleanup_live_files(task_id)
-        gc.collect()
+        _free_memory()
 
 
 def _cleanup_live_files(task_id):
@@ -998,4 +1002,4 @@ async def process_playlist_queue(application, playlist_queue):
             await update_status_msg(f"🔥 Error: {e}")
         finally:
             playlist_queue.task_done()
-            gc.collect()
+            _free_memory()
