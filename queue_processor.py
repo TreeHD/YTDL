@@ -941,12 +941,40 @@ async def process_playlist_queue(application, playlist_queue):
 
             await update_status_msg("📋 Getting playlist info...")
             loop = asyncio.get_running_loop()
-            
+
             try:
-                info = await asyncio.wait_for(
-                    loop.run_in_executor(None, lambda: get_playlist_info(url)),
-                    timeout=60
+                cancel_event = asyncio.Event()
+
+                async def _watch_cancel():
+                    while not cancel_event.is_set():
+                        if task_id in cancelled_tasks:
+                            cancel_event.set()
+                            return
+                        await asyncio.sleep(1)
+
+                watcher = asyncio.create_task(_watch_cancel())
+                info_future = loop.run_in_executor(None, lambda: get_playlist_info(url))
+
+                done, _ = await asyncio.wait(
+                    [info_future, watcher],
+                    timeout=60,
+                    return_when=asyncio.FIRST_COMPLETED,
                 )
+
+                cancel_event.set()
+                watcher.cancel()
+
+                if task_id in cancelled_tasks:
+                    await update_status_msg("❌ Playlist cancelled.")
+                    cancelled_tasks.discard(task_id)
+                    continue
+
+                if info_future in done:
+                    info = info_future.result()
+                else:
+                    await update_status_msg("❌ Timeout getting playlist info.")
+                    continue
+
                 entries = info.get('entries', [])
                 playlist_title = info.get('title', 'Playlist')
                 total_videos = len(entries)
@@ -992,8 +1020,6 @@ async def process_playlist_queue(application, playlist_queue):
                 
                 await update_status_msg(f"✨ Playlist complete! Finished {total_videos} videos.", send_new=True)
 
-            except asyncio.TimeoutError:
-                await update_status_msg("❌ Timeout getting playlist info.")
             except Exception as e:
                 await update_status_msg(f"❌ Failed to get playlist info: {e}")
 
