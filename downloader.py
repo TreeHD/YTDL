@@ -33,6 +33,7 @@ GEO_RESTRICTION_ERRORS = [
     'bot',
     'cookies are required',
     'Sign in to confirm you\'re not a bot',
+    '403',
 ]
 
 def restart_warp_proxy():
@@ -66,6 +67,8 @@ def _apply_cookie(ydl_opts):
     if cookie_file:
         ydl_opts['cookiefile'] = cookie_file
     ydl_opts['remote_components'] = ['ejs:github']
+    ydl_opts['quiet'] = False
+    ydl_opts['no_warnings'] = False
     return ydl_opts
 
 # --- Video Info Extraction ---
