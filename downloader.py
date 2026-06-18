@@ -61,10 +61,11 @@ def is_geo_restricted_error(error_msg, proxy_url=None):
     return matched
 
 def _apply_cookie(ydl_opts):
-    """Inject cookiefile into ydl_opts if a cookie jar is present."""
+    """Inject cookiefile and common options into ydl_opts."""
     cookie_file = get_cookie_file()
     if cookie_file:
         ydl_opts['cookiefile'] = cookie_file
+    ydl_opts['remote_components'] = ['ejs:github']
     return ydl_opts
 
 # --- Video Info Extraction ---

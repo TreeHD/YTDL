@@ -863,12 +863,12 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
 
     except Exception as e:
         logger.error(f"[LIVE:{task_id}] UNHANDLED EXCEPTION: {e}", exc_info=True)
-        _cleanup_live_files(task_id)
         try:
             await update_status_msg(f"\U0001f525 Live recording error: {e}", force=True)
         except Exception as e2:
             logger.error(f"[LIVE:{task_id}] Could not send error msg: {e2}", exc_info=True)
     finally:
+        _cleanup_live_files(task_id)
         gc.collect()
 
 
