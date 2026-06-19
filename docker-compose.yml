@@ -20,6 +20,7 @@ services:
     image: aiogram/telegram-bot-api:latest
     container_name: telegram-bot-api
     restart: unless-stopped
+    user: root
     env_file:
       - .env
     volumes:

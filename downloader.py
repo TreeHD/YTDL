@@ -171,7 +171,6 @@ def get_latest_videos(channel_id, limit=5):
             'quiet': True,
             'no_warnings': True,
             'extract_flat': True,
-            'playlist_items': f'1-{limit}',
             'playlistend': limit,
             'socket_timeout': 10,
             'retries': 2,

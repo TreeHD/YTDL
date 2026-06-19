@@ -20,12 +20,13 @@ logger = logging.getLogger(__name__)
 
 class SubscriptionMonitor:
     """Monitor subscribed channels for new videos."""
-    
+
     def __init__(self, application, request_queue):
         self.application = application
         self.request_queue = request_queue
         self.running = False
         self.task = None
+        self.active_live_recordings = set()
     
     async def start(self):
         """Start the subscription monitor."""
@@ -153,8 +154,13 @@ class SubscriptionMonitor:
                 if not is_video_processed(live_id):
                     logger.info(f"New LIVE stream found: {live_info['title']} from {channel_name}")
                     mark_video_processed(live_id, channel_id, live_info['title'])
-                    
+
                     for sub in subscribers:
+                        rec_key = f"{channel_id}_{sub['chat_id']}"
+                        if rec_key in self.active_live_recordings:
+                            logger.info(f"Skipping duplicate live recording for {channel_name} in chat {sub['chat_id']}")
+                            continue
+                        self.active_live_recordings.add(rec_key)
                         try:
                             msg = await self.application.bot.send_message(
                                 chat_id=sub['chat_id'],
@@ -173,7 +179,12 @@ class SubscriptionMonitor:
                                 True # is_live
                             ))
                         except Exception as e:
+                            self.active_live_recordings.discard(rec_key)
                             logger.error(f"Failed to notify live for chat {sub['chat_id']}: {e}")
+            else:
+                # Channel no longer live — clear active recording locks for this channel
+                to_remove = {k for k in self.active_live_recordings if k.startswith(f"{channel_id}_")}
+                self.active_live_recordings -= to_remove
         except Exception as e:
             logger.error(f"Error checking live for {channel_id}: {e}")
 
