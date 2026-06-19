@@ -19,6 +19,19 @@ def _free_memory():
     """Force garbage collection. With PYTHONMALLOC=malloc on musl, freed pages return to OS automatically."""
     gc.collect()
 
+def _cleanup_partial_downloads():
+    """Remove .part files and orphaned thumbnails from downloads directory."""
+    for f in glob.glob(os.path.join(DOWNLOAD_DIR, "*.part")):
+        try: os.remove(f)
+        except: pass
+    for ext in ('*.jpg', '*.webp', '*.jpeg'):
+        for f in glob.glob(os.path.join(DOWNLOAD_DIR, ext)):
+            base = os.path.splitext(f)[0]
+            has_video = any(os.path.exists(base + v) for v in ('.mp4', '.mkv', '.webm', '.m4a', '.mp3'))
+            if not has_video:
+                try: os.remove(f)
+                except: pass
+
 async def tg_retry(func, *args, **kwargs):
     """Retry Telegram API calls up to 10 times on RateLimit."""
     max_retries = 10
@@ -286,10 +299,8 @@ async def process_queue(application, request_queue):
             except Exception as e:
                 # Cleanup potential partial files on failure
                 logger.error(f"Download failed for {url}: {e}")
-                for f in glob.glob(os.path.join(DOWNLOAD_DIR, f"*{task_id}*")):
-                    try: os.remove(f)
-                    except: pass
-                
+                _cleanup_partial_downloads()
+
                 await update_status_msg(f"❌ Download failed: {e}", force=True)
                 continue
             
@@ -724,7 +735,18 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                         continue
                     else:
                         consecutive_failures = 0
-                        # Had data but crashed — start new part, keep accumulating
+                        # Had data but crashed — check if we need to segment first
+                        total_size = _get_total_parts_size(part_files)
+                        if total_size >= SEGMENT_SIZE_BYTES:
+                            logger.info(f"[LIVE:{task_id}] Crash recovery: size {total_size/(1024*1024):.1f}MB >= limit, segmenting")
+                            segment_num += 1
+                            seg_ts = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_{segment_num:03d}.ts")
+                            seg_mp4 = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_{segment_num:03d}.mp4")
+                            if await _concat_parts(part_files, seg_ts):
+                                bg_tasks.append(asyncio.create_task(_remux_and_upload(seg_ts, seg_mp4, segment_num)))
+                                uploaded_segments.append(segment_num)
+                            part_files = []
+                        # Start new part
                         part_num += 1
                         current_part = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_p{part_num:03d}.ts")
                         part_files.append(current_part)
@@ -736,9 +758,19 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                         await live_status(f"\U0001f534 Recording live stream: {channel_name}")
                         continue
                 else:
-                    # rc=0: streamlink exited cleanly — try to restart
+                    # rc=0: streamlink exited cleanly — check size before restarting
                     consecutive_failures = 0
                     logger.info(f"[LIVE:{task_id}] streamlink exited rc=0, trying to continue...")
+                    total_size = _get_total_parts_size(part_files)
+                    if total_size >= SEGMENT_SIZE_BYTES:
+                        logger.info(f"[LIVE:{task_id}] Clean exit: size {total_size/(1024*1024):.1f}MB >= limit, segmenting")
+                        segment_num += 1
+                        seg_ts = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_{segment_num:03d}.ts")
+                        seg_mp4 = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_{segment_num:03d}.mp4")
+                        if await _concat_parts(part_files, seg_ts):
+                            bg_tasks.append(asyncio.create_task(_remux_and_upload(seg_ts, seg_mp4, segment_num)))
+                            uploaded_segments.append(segment_num)
+                        part_files = []
                     await asyncio.sleep(3)
                     part_num += 1
                     current_part = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_p{part_num:03d}.ts")
@@ -990,13 +1022,15 @@ async def process_playlist_queue(application, playlist_queue):
                     if task_id in cancelled_tasks:
                         await update_status_msg("❌ Playlist cancelled.")
                         cancelled_tasks.discard(task_id)
+                        _cleanup_partial_downloads()
                         break
-                    
+
                     v_url = entry['url']
                     v_title = entry['title']
-                    
+                    v_id = entry.get('id') or v_url.split('v=')[-1].split('&')[0] if 'v=' in v_url else ''
+
                     await update_status_msg(f"🔄 Processing {i+1}/{total_videos}: {v_title[:30]}...", send_new=True)
-                    
+
                     def progress_cb(d):
                         if task_id in cancelled_tasks: raise Exception("Cancelled")
                         if d['status'] == 'downloading':
@@ -1012,9 +1046,10 @@ async def process_playlist_queue(application, playlist_queue):
                     except Exception as e:
                         logger.error(f"Failed for video {i+1}: {e}")
                         await application.bot.send_message(chat_id=chat_id, text=f"⚠️ Skipped {v_title[:30]}: {e}")
-                        for f in glob.glob(os.path.join(DOWNLOAD_DIR, f"*{task_id}*")):
-                            try: os.remove(f)
-                            except: pass
+                        if v_id:
+                            for f in glob.glob(os.path.join(DOWNLOAD_DIR, f"*{v_id}*")):
+                                try: os.remove(f)
+                                except: pass
                         continue
 
                 
@@ -1027,5 +1062,6 @@ async def process_playlist_queue(application, playlist_queue):
             logger.error(f"Playlist error: {e}")
             await update_status_msg(f"🔥 Error: {e}")
         finally:
+            _cleanup_partial_downloads()
             playlist_queue.task_done()
             _free_memory()
