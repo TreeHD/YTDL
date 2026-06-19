@@ -435,6 +435,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                 logger.error(f"[LIVE:{bg_id}] Spawn failed: {e}", exc_info=True)
                 continue
 
+            start_time = time.time()
             while True:
                 if proc.returncode is not None:
                     break
@@ -443,6 +444,14 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                     _cleanup_live_files(bg_id)
                     logger.info(f"[LIVE:{bg_id}] Cancelled")
                     return
+                # Timeout: if no meaningful data after 90s, VOD likely unavailable
+                elapsed = time.time() - start_time
+                if elapsed > 90:
+                    file_size = os.path.getsize(bg_ts) if os.path.exists(bg_ts) else 0
+                    if file_size < 100 * 1024:
+                        logger.warning(f"[LIVE:{bg_id}] No data after {elapsed:.0f}s (size={file_size}), VOD likely unavailable")
+                        await _kill_process(proc, bg_id)
+                        break
                 await asyncio.sleep(5)
 
             if proc.returncode == 0:
@@ -525,42 +534,33 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
         logger.info(f"[LIVE:{bg_id}] Background from-start download complete")
 
     async def _concat_parts(part_files, output_ts):
-        """Concatenate multiple .ts part files into one using ffmpeg concat."""
+        """Concatenate multiple .ts part files using binary concat (TS is designed for this)."""
         if len(part_files) == 1:
             os.rename(part_files[0], output_ts)
             return True
-        # Write concat list file
-        list_file = output_ts + '.list'
-        with open(list_file, 'w') as f:
-            for p in part_files:
-                f.write(f"file '{p}'\n")
         try:
-            proc = await asyncio.create_subprocess_exec(
-                get_ffmpeg_command(), '-y',
-                '-err_detect', 'ignore_err',
-                '-fflags', '+genpts+discardcorrupt',
-                '-f', 'concat', '-safe', '0',
-                '-i', list_file, '-c', 'copy', output_ts,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            await proc.stderr.read()
-            await proc.wait()
-            if proc.returncode == 0:
+            with open(output_ts, 'wb') as out:
+                for p in part_files:
+                    if os.path.exists(p) and os.path.getsize(p) > 0:
+                        with open(p, 'rb') as inp:
+                            while True:
+                                chunk = inp.read(8 * 1024 * 1024)
+                                if not chunk:
+                                    break
+                                out.write(chunk)
+            if os.path.exists(output_ts) and os.path.getsize(output_ts) > 0:
                 for p in part_files:
                     try: os.remove(p)
                     except: pass
-                try: os.remove(list_file)
-                except: pass
                 return True
             else:
-                logger.error(f"[LIVE:{task_id}] concat failed rc={proc.returncode}")
-                try: os.remove(list_file)
+                logger.error(f"[LIVE:{task_id}] binary concat produced empty file")
+                try: os.remove(output_ts)
                 except: pass
                 return False
         except Exception as e:
-            logger.error(f"[LIVE:{task_id}] concat error: {e}")
-            try: os.remove(list_file)
+            logger.error(f"[LIVE:{task_id}] binary concat error: {e}")
+            try: os.remove(output_ts)
             except: pass
             return False
 
@@ -741,6 +741,12 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                                 if await _concat_parts(part_files, seg_ts):
                                     bg_tasks.append(asyncio.create_task(_remux_and_upload(seg_ts, seg_mp4, segment_num, is_final=True)))
                                     uploaded_segments.append(segment_num)
+                                else:
+                                    for pi, p in enumerate(part_files, 1):
+                                        if os.path.exists(p) and os.path.getsize(p) > 1024:
+                                            p_mp4 = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_fallback{pi:03d}.mp4")
+                                            bg_tasks.append(asyncio.create_task(_remux_and_upload(p, p_mp4, pi, is_final=(pi == len(part_files)))))
+                                    uploaded_segments.append(segment_num)
                                 part_files = []
                             elif not uploaded_segments:
                                 await update_status_msg(f"❌ Recording failed after {consecutive_failures} attempts.", force=True)
@@ -767,6 +773,12 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                             if await _concat_parts(part_files, seg_ts):
                                 bg_tasks.append(asyncio.create_task(_remux_and_upload(seg_ts, seg_mp4, segment_num)))
                                 uploaded_segments.append(segment_num)
+                            else:
+                                for pi, p in enumerate(part_files, 1):
+                                    if os.path.exists(p) and os.path.getsize(p) > 1024:
+                                        p_mp4 = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_fallback{pi:03d}.mp4")
+                                        bg_tasks.append(asyncio.create_task(_remux_and_upload(p, p_mp4, pi)))
+                                uploaded_segments.append(segment_num)
                             part_files = []
                         # Start new part
                         part_num += 1
@@ -791,6 +803,12 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                         seg_mp4 = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_{segment_num:03d}.mp4")
                         if await _concat_parts(part_files, seg_ts):
                             bg_tasks.append(asyncio.create_task(_remux_and_upload(seg_ts, seg_mp4, segment_num)))
+                            uploaded_segments.append(segment_num)
+                        else:
+                            for pi, p in enumerate(part_files, 1):
+                                if os.path.exists(p) and os.path.getsize(p) > 1024:
+                                    p_mp4 = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_fallback{pi:03d}.mp4")
+                                    bg_tasks.append(asyncio.create_task(_remux_and_upload(p, p_mp4, pi)))
                             uploaded_segments.append(segment_num)
                         part_files = []
                     await asyncio.sleep(3)
@@ -897,6 +915,12 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                 if await _concat_parts(part_files, seg_ts):
                     bg_tasks.append(asyncio.create_task(_remux_and_upload(seg_ts, seg_mp4, segment_num)))
                     uploaded_segments.append(segment_num)
+                else:
+                    for pi, p in enumerate(part_files, 1):
+                        if os.path.exists(p) and os.path.getsize(p) > 1024:
+                            p_mp4 = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_fallback{pi:03d}.mp4")
+                            bg_tasks.append(asyncio.create_task(_remux_and_upload(p, p_mp4, pi)))
+                    uploaded_segments.append(segment_num)
 
                 # 4. Reset parts for next segment
                 part_files = [next_part]
@@ -971,13 +995,11 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
 
 
 def _cleanup_live_files(task_id):
-    """Remove any leftover live recording segments."""
-    for ext in ['*.mp4', '*.ts']:
-        for prefix in [f"live_{task_id}_{ext}", f"live_{task_id}_fromstart_{ext}"]:
-            pattern = os.path.join(DOWNLOAD_DIR, prefix)
-            for f in glob.glob(pattern):
-                try: os.remove(f)
-                except: pass
+    """Remove any leftover live recording segments and temp files."""
+    for pattern in [f"live_{task_id}_*", f"live_{task_id}_fromstart_*"]:
+        for f in glob.glob(os.path.join(DOWNLOAD_DIR, pattern)):
+            try: os.remove(f)
+            except: pass
 
 async def process_playlist_queue(application, playlist_queue):
     """Process playlist download queue SEQUENTIALLY to save space."""
