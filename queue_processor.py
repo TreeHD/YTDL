@@ -411,7 +411,8 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
         return cmd
 
     async def _download_from_start():
-        """Background task: download the stream from beginning using yt-dlp."""
+        """Background task: download the stream from beginning using yt-dlp.
+        Lets yt-dlp run to completion, then remux and use handle_upload which splits at 2GB."""
         bg_id = f"{task_id}_fromstart"
         logger.info(f"[LIVE:{bg_id}] Background from-start download starting")
         proxy_list = get_proxy_list()
@@ -419,11 +420,10 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
         bg_ts = os.path.join(DOWNLOAD_DIR, f"live_{bg_id}_001.ts")
         bg_mp4 = os.path.join(DOWNLOAD_DIR, f"live_{bg_id}_001.mp4")
 
-        success = False
+        proc = None
         for proxy in proxy_list:
             cmd = _build_fromstart_cmd(bg_ts, proxy)
             logger.info(f"[LIVE:{bg_id}] cmd: {' '.join(cmd[:8])}...")
-
             try:
                 proc = await asyncio.create_subprocess_exec(
                     *cmd,
@@ -431,46 +431,13 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                     stderr=asyncio.subprocess.DEVNULL,
                 )
                 logger.info(f"[LIVE:{bg_id}] pid={proc.pid}")
+                break
             except Exception as e:
                 logger.error(f"[LIVE:{bg_id}] Spawn failed: {e}", exc_info=True)
                 continue
 
-            start_time = time.time()
-            while True:
-                if proc.returncode is not None:
-                    break
-                if task_id in cancelled_tasks:
-                    await _kill_process(proc, bg_id)
-                    _cleanup_live_files(bg_id)
-                    logger.info(f"[LIVE:{bg_id}] Cancelled")
-                    return
-                # Timeout: if no meaningful data after 90s, VOD likely unavailable
-                elapsed = time.time() - start_time
-                if elapsed > 90:
-                    file_size = os.path.getsize(bg_ts) if os.path.exists(bg_ts) else 0
-                    if file_size < 100 * 1024:
-                        logger.warning(f"[LIVE:{bg_id}] No data after {elapsed:.0f}s (size={file_size}), VOD likely unavailable")
-                        await _kill_process(proc, bg_id)
-                        break
-                await asyncio.sleep(5)
-
-            if proc.returncode == 0:
-                success = True
-                break
-
-            logger.warning(f"[LIVE:{bg_id}] Failed proxy={proxy} rc={proc.returncode}")
-
-            if os.path.exists(bg_ts) and os.path.getsize(bg_ts) == 0:
-                try: os.remove(bg_ts)
-                except: pass
-
-            if os.path.exists(bg_ts) and os.path.getsize(bg_ts) == 0:
-                try: os.remove(bg_ts)
-                except: pass
-            continue
-
-        if not success:
-            logger.error(f"[LIVE:{bg_id}] All proxies failed")
+        if proc is None:
+            logger.error(f"[LIVE:{bg_id}] All proxies failed to spawn")
             try:
                 await tg_retry(
                     application.bot.send_message,
@@ -483,54 +450,99 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
             _cleanup_live_files(bg_id)
             return
 
-        # Remux and upload
-        ts_size = os.path.getsize(bg_ts) if os.path.exists(bg_ts) else 0
-        if ts_size > 0:
-            try:
-                remux = await asyncio.create_subprocess_exec(
+        # Poll until done, cancelled, or VOD unavailable
+        start_time = time.time()
+        last_log_size = 0
+        while True:
+            if proc.returncode is not None:
+                break
+            if task_id in cancelled_tasks:
+                await _kill_process(proc, bg_id)
+                _cleanup_live_files(bg_id)
+                logger.info(f"[LIVE:{bg_id}] Cancelled")
+                return
+
+            file_size = os.path.getsize(bg_ts) if os.path.exists(bg_ts) else 0
+
+            # Timeout: no meaningful data after 90s = VOD unavailable
+            elapsed = time.time() - start_time
+            if elapsed > 90 and file_size < 100 * 1024:
+                logger.warning(f"[LIVE:{bg_id}] No data after {elapsed:.0f}s, VOD likely unavailable")
+                await _kill_process(proc, bg_id)
+                try:
+                    await tg_retry(
+                        application.bot.send_message,
+                        chat_id=chat_id,
+                        text="❌ From-start download failed (VOD unavailable).",
+                        reply_to_message_id=message_id
+                    )
+                except Exception:
+                    pass
+                _cleanup_live_files(bg_id)
+                return
+
+            # Log progress every ~60s
+            if file_size > 0 and file_size - last_log_size > 50 * 1024 * 1024:
+                logger.info(f"[LIVE:{bg_id}] Downloading... {file_size/(1024*1024):.1f}MB")
+                last_log_size = file_size
+
+            await asyncio.sleep(5)
+
+        # Check result
+        file_size = os.path.getsize(bg_ts) if os.path.exists(bg_ts) else 0
+        if file_size < 1024:
+            logger.error(f"[LIVE:{bg_id}] No data after completion (rc={proc.returncode})")
+            _cleanup_live_files(bg_id)
+            return
+
+        # Remux .ts → .mp4
+        logger.info(f"[LIVE:{bg_id}] Remuxing {file_size/(1024*1024):.1f}MB")
+        try:
+            remux = await asyncio.create_subprocess_exec(
+                get_ffmpeg_command(), '-y',
+                '-err_detect', 'ignore_err',
+                '-fflags', '+genpts+discardcorrupt',
+                '-i', bg_ts,
+                '-c', 'copy', '-movflags', '+faststart', bg_mp4,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await remux.stderr.read()
+            await remux.wait()
+            if remux.returncode != 0:
+                remux2 = await asyncio.create_subprocess_exec(
                     get_ffmpeg_command(), '-y',
                     '-err_detect', 'ignore_err',
                     '-fflags', '+genpts+discardcorrupt',
                     '-i', bg_ts,
-                    '-c', 'copy', '-movflags', '+faststart', bg_mp4,
+                    '-c', 'copy', bg_mp4,
                     stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
                 )
-                await remux.stderr.read()
-                await remux.wait()
-                if remux.returncode != 0:
-                    remux2 = await asyncio.create_subprocess_exec(
-                        get_ffmpeg_command(), '-y',
-                        '-err_detect', 'ignore_err',
-                        '-fflags', '+genpts+discardcorrupt',
-                        '-i', bg_ts,
-                        '-c', 'copy', bg_mp4,
-                        stdout=asyncio.subprocess.DEVNULL,
-                        stderr=asyncio.subprocess.DEVNULL,
-                    )
-                    await remux2.wait()
-                if os.path.exists(bg_mp4) and os.path.getsize(bg_mp4) > 0:
-                    try: os.remove(bg_ts)
-                    except: pass
-                else:
-                    logger.error(f"[LIVE:{bg_id}] Remux produced no output")
-                    try: os.remove(bg_ts)
-                    except: pass
-                    return
-            except Exception as e:
-                logger.error(f"[LIVE:{bg_id}] Remux error: {e}", exc_info=True)
-                try: os.remove(bg_ts)
-                except: pass
-                return
+                await remux2.wait()
+        except Exception as e:
+            logger.error(f"[LIVE:{bg_id}] Remux error: {e}", exc_info=True)
+            _cleanup_live_files(bg_id)
+            return
 
-            try:
-                title = f"⏪ {channel_name} - From Start"
-                logger.info(f"[LIVE:{bg_id}] Uploading: {title}")
-                await handle_upload(application, chat_id, bg_mp4, title, url, False, update_status_msg, channel_name, message_id)
-                logger.info(f"[LIVE:{bg_id}] Upload done")
-            except Exception as e:
-                logger.error(f"[LIVE:{bg_id}] Upload failed: {e}", exc_info=True)
+        try: os.remove(bg_ts)
+        except: pass
 
+        if not os.path.exists(bg_mp4) or os.path.getsize(bg_mp4) == 0:
+            logger.error(f"[LIVE:{bg_id}] Remux produced no output")
+            _cleanup_live_files(bg_id)
+            return
+
+        # Upload via handle_upload — it handles splitting at 2GB automatically
+        try:
+            title = f"⏪ {channel_name} - From Start"
+            logger.info(f"[LIVE:{bg_id}] Uploading: {title} ({os.path.getsize(bg_mp4)/(1024*1024):.1f}MB)")
+            await handle_upload(application, chat_id, bg_mp4, title, url, False, None, channel_name, message_id)
+            logger.info(f"[LIVE:{bg_id}] Upload done")
+        except Exception as e:
+            logger.error(f"[LIVE:{bg_id}] Upload failed: {e}", exc_info=True)
+
+        _cleanup_live_files(bg_id)
         logger.info(f"[LIVE:{bg_id}] Background from-start download complete")
 
     async def _concat_parts(part_files, output_ts):
