@@ -412,13 +412,12 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
 
     async def _download_from_start():
         """Background task: download the stream from beginning using yt-dlp.
-        Lets yt-dlp run to completion, then remux and use handle_upload which splits at 2GB."""
+        Monitors file size and splits at 1.9GB boundaries while yt-dlp keeps writing."""
         bg_id = f"{task_id}_fromstart"
         logger.info(f"[LIVE:{bg_id}] Background from-start download starting")
         proxy_list = get_proxy_list()
 
-        bg_ts = os.path.join(DOWNLOAD_DIR, f"live_{bg_id}_001.ts")
-        bg_mp4 = os.path.join(DOWNLOAD_DIR, f"live_{bg_id}_001.mp4")
+        bg_ts = os.path.join(DOWNLOAD_DIR, f"live_{bg_id}.ts")
 
         proc = None
         for proxy in proxy_list:
@@ -447,12 +446,14 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                 )
             except Exception:
                 pass
-            _cleanup_live_files(bg_id)
             return
 
-        # Poll until done, cancelled, or VOD unavailable
+        # Track how many bytes we've already split off
+        consumed_bytes = 0
+        seg_num = 0
         start_time = time.time()
         last_log_size = 0
+
         while True:
             if proc.returncode is not None:
                 break
@@ -461,8 +462,14 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                 _cleanup_live_files(bg_id)
                 logger.info(f"[LIVE:{bg_id}] Cancelled")
                 return
+            # Stop & Upload — gracefully stop and upload what we have
+            if task_id in stopped_tasks:
+                logger.info(f"[LIVE:{bg_id}] Stop signal received, finishing up")
+                await _kill_process(proc, bg_id)
+                break
 
             file_size = os.path.getsize(bg_ts) if os.path.exists(bg_ts) else 0
+            available = file_size - consumed_bytes
 
             # Timeout: no meaningful data after 90s = VOD unavailable
             elapsed = time.time() - start_time
@@ -481,29 +488,79 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                 _cleanup_live_files(bg_id)
                 return
 
-            # Log progress every ~60s
-            if file_size > 0 and file_size - last_log_size > 50 * 1024 * 1024:
-                logger.info(f"[LIVE:{bg_id}] Downloading... {file_size/(1024*1024):.1f}MB")
+            # Split segment when available data >= 1.9GB
+            if available >= SEGMENT_SIZE_BYTES:
+                seg_num += 1
+                seg_ts = os.path.join(DOWNLOAD_DIR, f"live_{bg_id}_seg{seg_num:03d}.ts")
+                seg_mp4 = os.path.join(DOWNLOAD_DIR, f"live_{bg_id}_seg{seg_num:03d}.mp4")
+                # Read the segment bytes from the growing file
+                try:
+                    with open(bg_ts, 'rb') as f:
+                        f.seek(consumed_bytes)
+                        with open(seg_ts, 'wb') as out:
+                            remaining = SEGMENT_SIZE_BYTES
+                            while remaining > 0:
+                                chunk = f.read(min(remaining, 8 * 1024 * 1024))
+                                if not chunk:
+                                    break
+                                out.write(chunk)
+                                remaining -= len(chunk)
+                    consumed_bytes += SEGMENT_SIZE_BYTES
+                    logger.info(f"[LIVE:{bg_id}] Split seg {seg_num}: {SEGMENT_SIZE_BYTES/(1024*1024):.0f}MB, consumed={consumed_bytes/(1024*1024):.0f}MB")
+                    # Remux and upload in background
+                    asyncio.create_task(_remux_and_upload_bg(bg_id, seg_ts, seg_mp4, seg_num))
+                except Exception as e:
+                    logger.error(f"[LIVE:{bg_id}] Split error: {e}", exc_info=True)
+
+            # Log progress
+            if file_size > 0 and file_size - last_log_size > 100 * 1024 * 1024:
+                logger.info(f"[LIVE:{bg_id}] Downloading... {file_size/(1024*1024):.1f}MB (consumed={consumed_bytes/(1024*1024):.0f}MB)")
                 last_log_size = file_size
 
             await asyncio.sleep(5)
 
-        # Check result
+        # Handle remaining data after yt-dlp exits
         file_size = os.path.getsize(bg_ts) if os.path.exists(bg_ts) else 0
-        if file_size < 1024:
-            logger.error(f"[LIVE:{bg_id}] No data after completion (rc={proc.returncode})")
-            _cleanup_live_files(bg_id)
-            return
+        remaining_bytes = file_size - consumed_bytes
+        if remaining_bytes > 1024:
+            seg_num += 1
+            seg_ts = os.path.join(DOWNLOAD_DIR, f"live_{bg_id}_seg{seg_num:03d}.ts")
+            seg_mp4 = os.path.join(DOWNLOAD_DIR, f"live_{bg_id}_seg{seg_num:03d}.mp4")
+            try:
+                with open(bg_ts, 'rb') as f:
+                    f.seek(consumed_bytes)
+                    with open(seg_ts, 'wb') as out:
+                        while True:
+                            chunk = f.read(8 * 1024 * 1024)
+                            if not chunk:
+                                break
+                            out.write(chunk)
+                logger.info(f"[LIVE:{bg_id}] Final seg {seg_num}: {remaining_bytes/(1024*1024):.1f}MB")
+                await _remux_and_upload_bg(bg_id, seg_ts, seg_mp4, seg_num, is_final=True)
+            except Exception as e:
+                logger.error(f"[LIVE:{bg_id}] Final segment error: {e}", exc_info=True)
 
-        # Remux .ts → .mp4
-        logger.info(f"[LIVE:{bg_id}] Remuxing {file_size/(1024*1024):.1f}MB")
+        # Clean up the original large .ts file
+        try: os.remove(bg_ts)
+        except: pass
+        _cleanup_live_files(bg_id)
+        logger.info(f"[LIVE:{bg_id}] Complete. Total segments: {seg_num}")
+
+    async def _remux_and_upload_bg(bg_id, ts_path, mp4_path, seg_num, is_final=False):
+        """Remux a from-start segment and upload."""
         try:
+            ts_size = os.path.getsize(ts_path) if os.path.exists(ts_path) else 0
+            if ts_size == 0:
+                try: os.remove(ts_path)
+                except: pass
+                return
+            logger.info(f"[LIVE:{bg_id}] Remuxing seg {seg_num}: {ts_size/(1024*1024):.1f}MB")
             remux = await asyncio.create_subprocess_exec(
                 get_ffmpeg_command(), '-y',
                 '-err_detect', 'ignore_err',
                 '-fflags', '+genpts+discardcorrupt',
-                '-i', bg_ts,
-                '-c', 'copy', '-movflags', '+faststart', bg_mp4,
+                '-i', ts_path,
+                '-c', 'copy', '-movflags', '+faststart', mp4_path,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -514,36 +571,26 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                     get_ffmpeg_command(), '-y',
                     '-err_detect', 'ignore_err',
                     '-fflags', '+genpts+discardcorrupt',
-                    '-i', bg_ts,
-                    '-c', 'copy', bg_mp4,
+                    '-i', ts_path,
+                    '-c', 'copy', mp4_path,
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.DEVNULL,
                 )
                 await remux2.wait()
+            try: os.remove(ts_path)
+            except: pass
+
+            if os.path.exists(mp4_path) and os.path.getsize(mp4_path) > 0:
+                title = f"⏪ {channel_name} - From Start Part {seg_num}"
+                if is_final:
+                    title += " (End)"
+                logger.info(f"[LIVE:{bg_id}] Uploading seg {seg_num}: {os.path.getsize(mp4_path)/(1024*1024):.1f}MB")
+                await handle_upload(application, chat_id, mp4_path, title, url, False, None, channel_name, message_id)
+                logger.info(f"[LIVE:{bg_id}] Upload done seg {seg_num}")
+            else:
+                logger.error(f"[LIVE:{bg_id}] Remux produced no output for seg {seg_num}")
         except Exception as e:
-            logger.error(f"[LIVE:{bg_id}] Remux error: {e}", exc_info=True)
-            _cleanup_live_files(bg_id)
-            return
-
-        try: os.remove(bg_ts)
-        except: pass
-
-        if not os.path.exists(bg_mp4) or os.path.getsize(bg_mp4) == 0:
-            logger.error(f"[LIVE:{bg_id}] Remux produced no output")
-            _cleanup_live_files(bg_id)
-            return
-
-        # Upload via handle_upload — it handles splitting at 2GB automatically
-        try:
-            title = f"⏪ {channel_name} - From Start"
-            logger.info(f"[LIVE:{bg_id}] Uploading: {title} ({os.path.getsize(bg_mp4)/(1024*1024):.1f}MB)")
-            await handle_upload(application, chat_id, bg_mp4, title, url, False, None, channel_name, message_id)
-            logger.info(f"[LIVE:{bg_id}] Upload done")
-        except Exception as e:
-            logger.error(f"[LIVE:{bg_id}] Upload failed: {e}", exc_info=True)
-
-        _cleanup_live_files(bg_id)
-        logger.info(f"[LIVE:{bg_id}] Background from-start download complete")
+            logger.error(f"[LIVE:{bg_id}] Remux/upload seg {seg_num} error: {e}", exc_info=True)
 
     async def _concat_parts(part_files, output_ts):
         """Concatenate multiple .ts part files using binary concat (TS is designed for this)."""
@@ -1007,11 +1054,14 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
 
 
 def _cleanup_live_files(task_id):
-    """Remove any leftover live recording segments and temp files."""
-    for pattern in [f"live_{task_id}_*", f"live_{task_id}_fromstart_*"]:
-        for f in glob.glob(os.path.join(DOWNLOAD_DIR, pattern)):
-            try: os.remove(f)
-            except: pass
+    """Remove any leftover live recording segments and temp files.
+    When called with main task_id, skips fromstart files (they manage their own cleanup)."""
+    is_fromstart = 'fromstart' in task_id
+    for f in glob.glob(os.path.join(DOWNLOAD_DIR, f"live_{task_id}*")):
+        if not is_fromstart and 'fromstart' in f:
+            continue
+        try: os.remove(f)
+        except: pass
 
 async def process_playlist_queue(application, playlist_queue):
     """Process playlist download queue SEQUENTIALLY to save space."""
