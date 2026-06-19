@@ -319,18 +319,25 @@ async def process_queue(application, request_queue):
             _free_memory()
 
 async def _kill_process(process, task_id):
-    """Terminate process, wait with timeout, kill if stuck."""
+    """Gracefully stop process: SIGINT → SIGTERM → SIGKILL."""
+    import signal
     try:
-        process.terminate()
-        await asyncio.wait_for(process.wait(), timeout=5)
-        logger.info(f"[LIVE:{task_id}] Process terminated gracefully")
+        process.send_signal(signal.SIGINT)
+        await asyncio.wait_for(process.wait(), timeout=20)
+        logger.info(f"[LIVE:{task_id}] Process stopped gracefully via SIGINT")
     except asyncio.TimeoutError:
-        logger.warning(f"[LIVE:{task_id}] Process didn't exit after SIGTERM, sending SIGKILL")
+        logger.warning(f"[LIVE:{task_id}] SIGINT timeout, sending SIGTERM")
         try:
-            process.kill()
-            await asyncio.wait_for(process.wait(), timeout=3)
-        except Exception:
-            logger.error(f"[LIVE:{task_id}] SIGKILL also failed, process may be orphaned")
+            process.terminate()
+            await asyncio.wait_for(process.wait(), timeout=15)
+            logger.info(f"[LIVE:{task_id}] Process terminated via SIGTERM")
+        except asyncio.TimeoutError:
+            logger.warning(f"[LIVE:{task_id}] SIGTERM timeout, sending SIGKILL")
+            try:
+                process.kill()
+                await asyncio.wait_for(process.wait(), timeout=10)
+            except Exception:
+                logger.error(f"[LIVE:{task_id}] SIGKILL also failed, process may be orphaned")
     except Exception as e:
         logger.error(f"[LIVE:{task_id}] _kill_process error: {e}", exc_info=True)
 
@@ -472,7 +479,10 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
         if ts_size > 0:
             try:
                 remux = await asyncio.create_subprocess_exec(
-                    get_ffmpeg_command(), '-y', '-i', bg_ts,
+                    get_ffmpeg_command(), '-y',
+                    '-err_detect', 'ignore_err',
+                    '-fflags', '+genpts+discardcorrupt',
+                    '-i', bg_ts,
                     '-c', 'copy', '-movflags', '+faststart', bg_mp4,
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.PIPE,
@@ -481,7 +491,10 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                 await remux.wait()
                 if remux.returncode != 0:
                     remux2 = await asyncio.create_subprocess_exec(
-                        get_ffmpeg_command(), '-y', '-i', bg_ts,
+                        get_ffmpeg_command(), '-y',
+                        '-err_detect', 'ignore_err',
+                        '-fflags', '+genpts+discardcorrupt',
+                        '-i', bg_ts,
                         '-c', 'copy', bg_mp4,
                         stdout=asyncio.subprocess.DEVNULL,
                         stderr=asyncio.subprocess.DEVNULL,
@@ -523,7 +536,10 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                 f.write(f"file '{p}'\n")
         try:
             proc = await asyncio.create_subprocess_exec(
-                get_ffmpeg_command(), '-y', '-f', 'concat', '-safe', '0',
+                get_ffmpeg_command(), '-y',
+                '-err_detect', 'ignore_err',
+                '-fflags', '+genpts+discardcorrupt',
+                '-f', 'concat', '-safe', '0',
                 '-i', list_file, '-c', 'copy', output_ts,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
@@ -559,7 +575,10 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
 
             logger.info(f"[LIVE:{task_id}] BG remux seg {seg_num}: {ts_size/(1024*1024):.1f}MB")
             remux = await asyncio.create_subprocess_exec(
-                get_ffmpeg_command(), '-y', '-i', ts_path,
+                get_ffmpeg_command(), '-y',
+                '-err_detect', 'ignore_err',
+                '-fflags', '+genpts+discardcorrupt',
+                '-i', ts_path,
                 '-c', 'copy', '-movflags', '+faststart', mp4_path,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
@@ -568,7 +587,10 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
             await remux.wait()
             if remux.returncode != 0:
                 remux2 = await asyncio.create_subprocess_exec(
-                    get_ffmpeg_command(), '-y', '-i', ts_path,
+                    get_ffmpeg_command(), '-y',
+                    '-err_detect', 'ignore_err',
+                    '-fflags', '+genpts+discardcorrupt',
+                    '-i', ts_path,
                     '-c', 'copy', mp4_path,
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.PIPE,
@@ -816,16 +838,34 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                 logger.info(f"[LIVE:{task_id}] Stop & Upload signal")
                 await _kill_process(process, task_id)
                 stopped_tasks.discard(task_id)
-                # Concat all parts and upload
-                total_size = _get_total_parts_size(part_files)
-                if total_size > 0:
+                # Filter out empty/tiny parts before concat
+                valid_parts = [p for p in part_files if os.path.exists(p) and os.path.getsize(p) > 1024]
+                total_size = sum(os.path.getsize(p) for p in valid_parts)
+                if total_size > 0 and valid_parts:
                     segment_num += 1
                     seg_ts = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_{segment_num:03d}.ts")
                     seg_mp4 = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_{segment_num:03d}.mp4")
-                    if await _concat_parts(part_files, seg_ts):
+                    if await _concat_parts(valid_parts, seg_ts):
                         bg_tasks.append(asyncio.create_task(_remux_and_upload(seg_ts, seg_mp4, segment_num, is_final=True)))
                         uploaded_segments.append(segment_num)
-                    part_files = []
+                    elif len(valid_parts) == 1:
+                        # Concat not needed for single file — just rename
+                        os.rename(valid_parts[0], seg_ts)
+                        bg_tasks.append(asyncio.create_task(_remux_and_upload(seg_ts, seg_mp4, segment_num, is_final=True)))
+                        uploaded_segments.append(segment_num)
+                    else:
+                        # Concat failed — try uploading each part individually
+                        logger.warning(f"[LIVE:{task_id}] Concat failed, uploading parts individually")
+                        for pi, p in enumerate(valid_parts, 1):
+                            p_mp4 = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_part{pi:03d}.mp4")
+                            bg_tasks.append(asyncio.create_task(_remux_and_upload(p, p_mp4, pi, is_final=(pi == len(valid_parts)))))
+                        uploaded_segments.append(segment_num)
+                # Clean up empty parts
+                for p in part_files:
+                    if p not in valid_parts and os.path.exists(p):
+                        try: os.remove(p)
+                        except: pass
+                part_files = []
                 break
 
             # Check from-start
@@ -881,14 +921,30 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
 
         # Upload remaining parts if any
         if part_files:
-            total_size = _get_total_parts_size(part_files)
-            if total_size > 0:
+            valid_parts = [p for p in part_files if os.path.exists(p) and os.path.getsize(p) > 1024]
+            total_size = sum(os.path.getsize(p) for p in valid_parts) if valid_parts else 0
+            if total_size > 0 and valid_parts:
                 segment_num += 1
                 seg_ts = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_{segment_num:03d}.ts")
                 seg_mp4 = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_{segment_num:03d}.mp4")
-                if await _concat_parts(part_files, seg_ts):
+                if await _concat_parts(valid_parts, seg_ts):
                     bg_tasks.append(asyncio.create_task(_remux_and_upload(seg_ts, seg_mp4, segment_num, is_final=True)))
                     uploaded_segments.append(segment_num)
+                elif len(valid_parts) == 1:
+                    os.rename(valid_parts[0], seg_ts)
+                    bg_tasks.append(asyncio.create_task(_remux_and_upload(seg_ts, seg_mp4, segment_num, is_final=True)))
+                    uploaded_segments.append(segment_num)
+                else:
+                    logger.warning(f"[LIVE:{task_id}] Final concat failed, uploading parts individually")
+                    for pi, p in enumerate(valid_parts, 1):
+                        p_mp4 = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_part{pi:03d}.mp4")
+                        bg_tasks.append(asyncio.create_task(_remux_and_upload(p, p_mp4, pi, is_final=(pi == len(valid_parts)))))
+                    uploaded_segments.append(segment_num)
+            # Clean up empty parts
+            for p in part_files:
+                if p not in valid_parts and os.path.exists(p):
+                    try: os.remove(p)
+                    except: pass
 
         # Wait for all background tasks
         if bg_tasks:
