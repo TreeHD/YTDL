@@ -1054,7 +1054,15 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
         except Exception as e2:
             logger.error(f"[LIVE:{task_id}] Could not send error msg: {e2}", exc_info=True)
     finally:
+        # Wait for any pending background tasks before cleanup
+        try:
+            if bg_tasks:
+                logger.info(f"[LIVE:{task_id}] Waiting for {len(bg_tasks)} bg tasks before cleanup...")
+                await asyncio.gather(*bg_tasks, return_exceptions=True)
+        except NameError:
+            pass
         _cleanup_live_files(task_id)
+        _cleanup_partial_downloads()
         _free_memory()
 
 
