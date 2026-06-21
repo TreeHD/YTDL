@@ -65,11 +65,21 @@ def is_retryable_error(error_msg, proxy_url=None):
             restart_warp_proxy()
     return matched
 
+_cookie_logged = False
+
 def _apply_cookie(ydl_opts):
     """Inject cookiefile, EJS runtime, and common options into ydl_opts."""
+    global _cookie_logged
     cookie_file = get_cookie_file()
     if cookie_file:
         ydl_opts['cookiefile'] = cookie_file
+        if not _cookie_logged:
+            logger.info("Cookie in use: %s", cookie_file)
+            _cookie_logged = True
+    else:
+        if not _cookie_logged:
+            logger.info("No cookie file found, proceeding without cookies")
+            _cookie_logged = True
     # Always enable EJS for n-parameter solving (needed regardless of cookies)
     ydl_opts['remote_components'] = ['ejs:github']
     path = os.environ.get('PATH', '')
