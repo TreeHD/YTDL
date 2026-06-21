@@ -910,16 +910,15 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
             if task_id in cancelled_tasks:
                 logger.info(f"[LIVE:{task_id}] Cancel signal")
                 await _kill_process(process, task_id)
-                cancelled_tasks.discard(task_id)
+                # Don't discard here — let from-start also see the signal
                 await update_status_msg("❌ Live recording cancelled.", force=True)
-                _cleanup_live_files(task_id)
                 return
 
             # Check stop & upload
             if task_id in stopped_tasks:
                 logger.info(f"[LIVE:{task_id}] Stop & Upload signal")
                 await _kill_process(process, task_id)
-                stopped_tasks.discard(task_id)
+                # Don't discard here — let from-start also see the signal
                 # Filter out empty/tiny parts before concat
                 valid_parts = [p for p in part_files if os.path.exists(p) and os.path.getsize(p) > 1024]
                 total_size = sum(os.path.getsize(p) for p in valid_parts)
@@ -955,7 +954,8 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                 logger.info(f"[LIVE:{task_id}] 'From Start' triggered")
                 fromstart_triggered = True
                 fromstart_tasks.discard(task_id)
-                asyncio.create_task(_download_from_start())
+                fromstart_task = asyncio.create_task(_download_from_start())
+                bg_tasks.append(fromstart_task)
                 await live_status(f"\U0001f534 Recording: {channel_name}\n⏪ Downloading from start in background...")
 
             # Check total accumulated size
@@ -1061,6 +1061,8 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                 await asyncio.gather(*bg_tasks, return_exceptions=True)
         except NameError:
             pass
+        stopped_tasks.discard(task_id)
+        cancelled_tasks.discard(task_id)
         _cleanup_live_files(task_id)
         _cleanup_partial_downloads()
         _free_memory()
