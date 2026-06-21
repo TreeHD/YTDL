@@ -86,7 +86,7 @@ def _apply_cookie(ydl_opts):
             _cookie_logged = True
     # Always enable EJS for n-parameter solving (needed regardless of cookies)
     ydl_opts['remote_components'] = ['ejs:github']
-    ydl_opts['js_runtimes'] = 'deno:/opt/deno/bin/deno'
+    ydl_opts['js_runtimes'] = {'deno': {'path': '/opt/deno/bin/deno'}}
     ydl_opts['quiet'] = False
     ydl_opts['no_warnings'] = False
     return ydl_opts
