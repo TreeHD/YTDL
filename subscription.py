@@ -163,7 +163,8 @@ class SubscriptionMonitor:
                             logger.info(f"Skipping duplicate live recording {live_info['id']} in chat {sub['chat_id']}")
                             continue
                         self.active_live_recordings.add(rec_key)
-                        self._live_channel_map[live_info['id']] = channel_id                        try:
+                        self._live_channel_map[live_info['id']] = channel_id
+                        try:
                             msg = await self.application.bot.send_message(
                                 chat_id=sub['chat_id'],
                                 text=f"🔴 **LIVE: {channel_name} is streaming now!**\n\n"
