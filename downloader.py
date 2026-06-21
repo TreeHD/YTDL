@@ -38,6 +38,7 @@ RETRY_ERRORS = [
     'timeout',
     'Connection refused',
     'Unable to download',
+    'Requested format is not available',
 ]
 
 def restart_warp_proxy():
