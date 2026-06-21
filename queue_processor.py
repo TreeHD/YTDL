@@ -392,8 +392,8 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
         cmd += [url, 'best']
         return cmd
 
-    def _build_fromstart_cmd(output_path, proxy=None):
-        """yt-dlp command for background from-start download."""
+    def _build_fromstart_cmd(proxy=None):
+        """yt-dlp command for from-start download, outputs to stdout."""
         cmd = [
             'yt-dlp',
             '--no-part',
@@ -405,7 +405,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
             '--socket-timeout', '30',
             '--retries', '10',
             '--fragment-retries', '10',
-            '-o', output_path,
+            '-o', '-',
         ]
         cookie_file = get_cookie_file()
         if cookie_file:
@@ -416,22 +416,20 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
         return cmd
 
     async def _download_from_start():
-        """Background task: download the stream from beginning using yt-dlp.
-        Monitors file size and splits at 1.9GB boundaries while yt-dlp keeps writing."""
+        """Background task: download the stream from beginning using yt-dlp via pipe.
+        Reads stdout directly into 1.9GB segment files — no giant .ts accumulating on disk."""
         bg_id = f"{task_id}_fromstart"
-        logger.info(f"[LIVE:{bg_id}] Background from-start download starting")
+        logger.info(f"[LIVE:{bg_id}] Background from-start download starting (pipe mode)")
         proxy_list = get_proxy_list()
-
-        bg_ts = os.path.join(DOWNLOAD_DIR, f"live_{bg_id}.ts")
 
         proc = None
         for proxy in proxy_list:
-            cmd = _build_fromstart_cmd(bg_ts, proxy)
+            cmd = _build_fromstart_cmd(proxy)
             logger.info(f"[LIVE:{bg_id}] cmd: {' '.join(cmd[:8])}...")
             try:
                 proc = await asyncio.create_subprocess_exec(
                     *cmd,
-                    stdout=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.DEVNULL,
                 )
                 logger.info(f"[LIVE:{bg_id}] pid={proc.pid}")
@@ -453,103 +451,107 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                 pass
             return
 
-        # Track how many bytes we've already split off
-        consumed_bytes = 0
         seg_num = 0
+        seg_file = None
+        seg_path = None
+        seg_bytes = 0
+        total_bytes = 0
         start_time = time.time()
-        last_log_size = 0
+        got_data = False
 
-        while True:
-            if proc.returncode is not None:
-                break
-            if task_id in cancelled_tasks:
-                await _kill_process(proc, bg_id)
-                _cleanup_live_files(bg_id)
-                logger.info(f"[LIVE:{bg_id}] Cancelled")
-                return
-            # Stop & Upload — gracefully stop and upload what we have
-            if task_id in stopped_tasks:
-                logger.info(f"[LIVE:{bg_id}] Stop signal received, finishing up")
-                await _kill_process(proc, bg_id)
-                break
+        try:
+            while True:
+                # Check signals
+                if task_id in cancelled_tasks:
+                    await _kill_process(proc, bg_id)
+                    _cleanup_live_files(bg_id)
+                    logger.info(f"[LIVE:{bg_id}] Cancelled")
+                    if seg_file:
+                        seg_file.close()
+                        try: os.remove(seg_path)
+                        except: pass
+                    return
+                if task_id in stopped_tasks:
+                    logger.info(f"[LIVE:{bg_id}] Stop signal received")
+                    await _kill_process(proc, bg_id)
+                    break
 
-            file_size = os.path.getsize(bg_ts) if os.path.exists(bg_ts) else 0
-            available = file_size - consumed_bytes
-
-            # Timeout: no meaningful data after 90s = VOD unavailable
-            elapsed = time.time() - start_time
-            if elapsed > 90 and file_size < 100 * 1024:
-                logger.warning(f"[LIVE:{bg_id}] No data after {elapsed:.0f}s, VOD likely unavailable")
-                await _kill_process(proc, bg_id)
+                # Read chunk from pipe (non-blocking with timeout)
                 try:
-                    await tg_retry(
-                        application.bot.send_message,
-                        chat_id=chat_id,
-                        text="❌ From-start download failed (VOD unavailable).",
-                        reply_to_message_id=message_id
-                    )
-                except Exception:
-                    pass
-                _cleanup_live_files(bg_id)
-                return
+                    chunk = await asyncio.wait_for(proc.stdout.read(1024 * 1024), timeout=5)
+                except asyncio.TimeoutError:
+                    # No data yet — check if process died
+                    if proc.returncode is not None:
+                        break
+                    # VOD unavailable check
+                    elapsed = time.time() - start_time
+                    if elapsed > 90 and not got_data:
+                        logger.warning(f"[LIVE:{bg_id}] No data after {elapsed:.0f}s, VOD likely unavailable")
+                        await _kill_process(proc, bg_id)
+                        try:
+                            await tg_retry(
+                                application.bot.send_message,
+                                chat_id=chat_id,
+                                text="❌ From-start download failed (VOD unavailable).",
+                                reply_to_message_id=message_id
+                            )
+                        except Exception:
+                            pass
+                        _cleanup_live_files(bg_id)
+                        return
+                    continue
 
-            # Split segment when available data >= 1.9GB
-            if available >= SEGMENT_SIZE_BYTES:
-                seg_num += 1
-                seg_ts = os.path.join(DOWNLOAD_DIR, f"live_{bg_id}_seg{seg_num:03d}.ts")
-                seg_mp4 = os.path.join(DOWNLOAD_DIR, f"live_{bg_id}_seg{seg_num:03d}.mp4")
-                # Read the segment bytes from the growing file
+                if not chunk:
+                    # EOF — yt-dlp finished
+                    break
+
+                got_data = True
+                total_bytes += len(chunk)
+
+                # Open new segment file if needed
+                if seg_file is None:
+                    seg_num += 1
+                    seg_path = os.path.join(DOWNLOAD_DIR, f"live_{bg_id}_seg{seg_num:03d}.ts")
+                    seg_file = open(seg_path, 'wb')
+                    seg_bytes = 0
+
+                seg_file.write(chunk)
+                seg_bytes += len(chunk)
+
+                # Segment full — close, remux+upload, start next
+                if seg_bytes >= SEGMENT_SIZE_BYTES:
+                    seg_file.close()
+                    seg_file = None
+                    seg_mp4 = os.path.join(DOWNLOAD_DIR, f"live_{bg_id}_seg{seg_num:03d}.mp4")
+                    logger.info(f"[LIVE:{bg_id}] Segment {seg_num} complete: {seg_bytes/(1024*1024):.1f}MB (total: {total_bytes/(1024*1024):.0f}MB)")
+                    asyncio.create_task(_remux_and_upload_bg(bg_id, seg_path, seg_mp4, seg_num))
+
+        except Exception as e:
+            logger.error(f"[LIVE:{bg_id}] Pipe read error: {e}", exc_info=True)
+        finally:
+            # Close last segment and upload if it has data
+            if seg_file:
+                seg_file.close()
+                if seg_bytes > 1024:
+                    seg_mp4 = os.path.join(DOWNLOAD_DIR, f"live_{bg_id}_seg{seg_num:03d}.mp4")
+                    logger.info(f"[LIVE:{bg_id}] Final segment {seg_num}: {seg_bytes/(1024*1024):.1f}MB (total: {total_bytes/(1024*1024):.0f}MB)")
+                    await _remux_and_upload_bg(bg_id, seg_path, seg_mp4, seg_num, is_final=True)
+                else:
+                    try: os.remove(seg_path)
+                    except: pass
+            elif seg_path and os.path.exists(seg_path) and os.path.getsize(seg_path) > 1024:
+                # Edge case: segment was closed by size limit but we need to mark last uploaded as final
+                pass
+
+            # Wait for proc to finish if still running
+            if proc.returncode is None:
                 try:
-                    with open(bg_ts, 'rb') as f:
-                        f.seek(consumed_bytes)
-                        with open(seg_ts, 'wb') as out:
-                            remaining = SEGMENT_SIZE_BYTES
-                            while remaining > 0:
-                                chunk = f.read(min(remaining, 8 * 1024 * 1024))
-                                if not chunk:
-                                    break
-                                out.write(chunk)
-                                remaining -= len(chunk)
-                    consumed_bytes += SEGMENT_SIZE_BYTES
-                    logger.info(f"[LIVE:{bg_id}] Split seg {seg_num}: {SEGMENT_SIZE_BYTES/(1024*1024):.0f}MB, consumed={consumed_bytes/(1024*1024):.0f}MB")
-                    # Remux and upload in background
-                    asyncio.create_task(_remux_and_upload_bg(bg_id, seg_ts, seg_mp4, seg_num))
-                except Exception as e:
-                    logger.error(f"[LIVE:{bg_id}] Split error: {e}", exc_info=True)
+                    await asyncio.wait_for(proc.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    await _kill_process(proc, bg_id)
 
-            # Log progress
-            if file_size > 0 and file_size - last_log_size > 100 * 1024 * 1024:
-                logger.info(f"[LIVE:{bg_id}] Downloading... {file_size/(1024*1024):.1f}MB (consumed={consumed_bytes/(1024*1024):.0f}MB)")
-                last_log_size = file_size
-
-            await asyncio.sleep(5)
-
-        # Handle remaining data after yt-dlp exits
-        file_size = os.path.getsize(bg_ts) if os.path.exists(bg_ts) else 0
-        remaining_bytes = file_size - consumed_bytes
-        if remaining_bytes > 1024:
-            seg_num += 1
-            seg_ts = os.path.join(DOWNLOAD_DIR, f"live_{bg_id}_seg{seg_num:03d}.ts")
-            seg_mp4 = os.path.join(DOWNLOAD_DIR, f"live_{bg_id}_seg{seg_num:03d}.mp4")
-            try:
-                with open(bg_ts, 'rb') as f:
-                    f.seek(consumed_bytes)
-                    with open(seg_ts, 'wb') as out:
-                        while True:
-                            chunk = f.read(8 * 1024 * 1024)
-                            if not chunk:
-                                break
-                            out.write(chunk)
-                logger.info(f"[LIVE:{bg_id}] Final seg {seg_num}: {remaining_bytes/(1024*1024):.1f}MB")
-                await _remux_and_upload_bg(bg_id, seg_ts, seg_mp4, seg_num, is_final=True)
-            except Exception as e:
-                logger.error(f"[LIVE:{bg_id}] Final segment error: {e}", exc_info=True)
-
-        # Clean up the original large .ts file
-        try: os.remove(bg_ts)
-        except: pass
-        _cleanup_live_files(bg_id)
-        logger.info(f"[LIVE:{bg_id}] Complete. Total segments: {seg_num}")
+            _cleanup_live_files(bg_id)
+            logger.info(f"[LIVE:{bg_id}] Complete. Segments: {seg_num}, Total: {total_bytes/(1024*1024):.1f}MB")
 
     async def _remux_and_upload_bg(bg_id, ts_path, mp4_path, seg_num, is_final=False):
         """Remux a from-start segment and upload."""
@@ -951,12 +953,37 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
 
             # Check from-start
             if task_id in fromstart_tasks and not fromstart_triggered:
-                logger.info(f"[LIVE:{task_id}] 'From Start' triggered")
+                logger.info(f"[LIVE:{task_id}] 'From Start' triggered — killing streamlink, yt-dlp takes over")
                 fromstart_triggered = True
                 fromstart_tasks.discard(task_id)
+
+                # 1. Kill streamlink
+                await _kill_process(process, task_id)
+
+                # 2. Upload whatever streamlink already recorded
+                valid_parts = [p for p in part_files if os.path.exists(p) and os.path.getsize(p) > 1024]
+                if valid_parts:
+                    total_recorded = sum(os.path.getsize(p) for p in valid_parts)
+                    logger.info(f"[LIVE:{task_id}] Uploading existing {total_recorded/(1024*1024):.1f}MB from streamlink before handoff")
+                    segment_num += 1
+                    seg_ts = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_{segment_num:03d}.ts")
+                    seg_mp4 = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_{segment_num:03d}.mp4")
+                    if await _concat_parts(valid_parts, seg_ts):
+                        bg_tasks.append(asyncio.create_task(_remux_and_upload(seg_ts, seg_mp4, segment_num)))
+                        uploaded_segments.append(segment_num)
+                    else:
+                        for pi, p in enumerate(valid_parts, 1):
+                            if os.path.exists(p) and os.path.getsize(p) > 1024:
+                                p_mp4 = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_fallback{pi:03d}.mp4")
+                                bg_tasks.append(asyncio.create_task(_remux_and_upload(p, p_mp4, pi)))
+                        uploaded_segments.append(segment_num)
+                part_files = []
+
+                # 3. Start from-start download (takes over entirely)
+                await live_status(f"\U0001f534 {channel_name}\n⏪ From Start: yt-dlp taking over...")
                 fromstart_task = asyncio.create_task(_download_from_start())
                 bg_tasks.append(fromstart_task)
-                await live_status(f"\U0001f534 Recording: {channel_name}\n⏪ Downloading from start in background...")
+                break
 
             # Check total accumulated size
             total_size = _get_total_parts_size(part_files)
