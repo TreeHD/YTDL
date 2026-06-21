@@ -66,17 +66,15 @@ def is_retryable_error(error_msg, proxy_url=None):
     return matched
 
 def _apply_cookie(ydl_opts):
-    """Inject cookiefile and common options into ydl_opts."""
+    """Inject cookiefile, EJS runtime, and common options into ydl_opts."""
     cookie_file = get_cookie_file()
     if cookie_file:
         ydl_opts['cookiefile'] = cookie_file
-        ydl_opts['remote_components'] = ['ejs:github']
-        path = os.environ.get('PATH', '')
-        if '/opt/deno/bin' not in path:
-            os.environ['PATH'] = '/opt/deno/bin:' + path
-    else:
-        if '/opt/deno/bin' in os.environ.get('PATH', ''):
-            os.environ['PATH'] = os.environ['PATH'].replace('/opt/deno/bin:', '')
+    # Always enable EJS for n-parameter solving (needed regardless of cookies)
+    ydl_opts['remote_components'] = ['ejs:github']
+    path = os.environ.get('PATH', '')
+    if '/opt/deno/bin' not in path:
+        os.environ['PATH'] = '/opt/deno/bin:' + path
     ydl_opts['quiet'] = False
     ydl_opts['no_warnings'] = False
     return ydl_opts
