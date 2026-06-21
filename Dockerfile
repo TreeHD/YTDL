@@ -31,5 +31,6 @@ COPY subscription.py .
 RUN mkdir -p /app/data /app/downloads
 
 ENV PYTHONMALLOC=malloc
+ENV PATH="/opt/deno/bin:${PATH}"
 
 CMD ["python", "bot.py"]

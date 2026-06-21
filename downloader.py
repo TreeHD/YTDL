@@ -11,10 +11,6 @@ from config import DOWNLOAD_DIR, get_proxy_list, load_config, get_ffmpeg_command
 
 logger = logging.getLogger(__name__)
 
-# Ensure deno is always in PATH for EJS n-parameter solving
-if '/opt/deno/bin' not in os.environ.get('PATH', ''):
-    os.environ['PATH'] = '/opt/deno/bin:' + os.environ.get('PATH', '')
-
 import urllib.request
 import urllib.error
 import time
@@ -86,7 +82,6 @@ def _apply_cookie(ydl_opts):
             _cookie_logged = True
     # Always enable EJS for n-parameter solving (needed regardless of cookies)
     ydl_opts['remote_components'] = ['ejs:github']
-    ydl_opts['js_runtimes'] = {'deno': {'path': '/opt/deno/bin/deno'}}
     ydl_opts['quiet'] = False
     ydl_opts['no_warnings'] = False
     return ydl_opts
