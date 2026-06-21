@@ -1,12 +1,13 @@
-# Base image
-FROM python:3.14.2-alpine3.23
+# Base image (Debian-based for glibc compatibility with deno)
+FROM python:3.14-slim
 
 WORKDIR /app
 
 # Install system dependencies
-RUN apk update && apk add --no-cache ffmpeg unzip
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg unzip wget && \
+    rm -rf /var/lib/apt/lists/*
 
-# Install deno to non-standard path (only used when cookies are present)
+# Install deno
 RUN DENO_VERSION=$(wget -qO- https://dl.deno.land/release-latest.txt) && \
     ARCH=$(uname -m) && \
     wget -qO /tmp/deno.zip "https://dl.deno.land/release/${DENO_VERSION}/deno-${ARCH}-unknown-linux-gnu.zip" && \

@@ -1,5 +1,6 @@
 import os
 import gc
+import ctypes
 import asyncio
 import time
 import logging
@@ -16,8 +17,12 @@ from handlers import cancelled_tasks, stopped_tasks, fromstart_tasks
 logger = logging.getLogger(__name__)
 
 def _free_memory():
-    """Force garbage collection. With PYTHONMALLOC=malloc on musl, freed pages return to OS automatically."""
+    """Force garbage collection and release memory back to OS via glibc malloc_trim."""
     gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
 
 def _cleanup_partial_downloads():
     """Remove .part files and orphaned thumbnails from downloads directory."""
