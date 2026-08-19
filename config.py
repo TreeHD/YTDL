@@ -19,7 +19,7 @@ COOKIE_FILE = './data/cookies.txt'
 
 # Telegram file size limits
 STANDARD_API_LIMIT = 50 * 1024 * 1024 - 1024 * 1024  # 49MB
-LOCAL_API_LIMIT = 2000 * 1024 * 1024 - 1024 * 1024 * 50  # ~1.95GB
+LOCAL_API_LIMIT = 1900 * 1024 * 1024  # 1900MiB safety target below Telegram's 2GB limit
 
 
 def env_flag(name, default=False):
