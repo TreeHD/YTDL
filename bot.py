@@ -20,10 +20,14 @@ from handlers import (
     handle_playlist_command, handle_message, 
     handle_subscribe_video, handle_subscribe_live,
     handle_unsubscribe, handle_subscriptions, cancel_callback, audio_callback,
-    handle_settings, settings_callback, stop_live_callback, fromstart_callback
+    handle_settings, settings_callback, stop_live_callback, fromstart_callback,
+    handle_upgrade
 )
-from queue_processor import process_queue, process_playlist_queue
+from queue_processor import (
+    process_queue, process_playlist_queue, has_active_downloads
+)
 from subscription import SubscriptionMonitor
+from upgrader import daily_upgrade_loop
 
 # Configure logging
 logging.basicConfig(
@@ -73,6 +77,7 @@ def main():
     # Basic commands
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('help', start))
+    application.add_handler(CommandHandler('upgrade', handle_upgrade))
     
     # Quality commands
     for quality in ['download', '1080', '720', '480', '360', '240']:
@@ -129,6 +134,7 @@ def main():
     task_holders = {
         'queue_task': None,
         'playlist_task': None,
+        'daily_upgrade_task': None,
         'subscription_monitor': None
     }
 
@@ -137,10 +143,22 @@ def main():
         # Store queues in bot_data for accessibility in handlers
         app.bot_data['request_queue'] = request_queue
         app.bot_data['playlist_queue'] = playlist_queue
+        app.bot_data['has_active_downloads'] = lambda: has_active_downloads(
+            request_queue, playlist_queue
+        )
 
         # Start queue processors
         task_holders['queue_task'] = asyncio.create_task(process_queue(app, request_queue))
         task_holders['playlist_task'] = asyncio.create_task(process_playlist_queue(app, playlist_queue))
+
+        if config.get('ytdlp_daily_update', True):
+            task_holders['daily_upgrade_task'] = asyncio.create_task(
+                daily_upgrade_loop(
+                    lambda: has_active_downloads(request_queue, playlist_queue)
+                )
+            )
+        else:
+            logger.info("Daily yt-dlp update is disabled.")
         
         # Start subscription monitor
         monitor = SubscriptionMonitor(app, request_queue)
@@ -157,7 +175,7 @@ def main():
             await monitor.stop()
         
         # Cancel queue tasks
-        for task_name in ['queue_task', 'playlist_task']:
+        for task_name in ['queue_task', 'playlist_task', 'daily_upgrade_task']:
             task = task_holders.get(task_name)
             if task and not task.done():
                 logger.info(f"Canceling {task_name}...")

@@ -21,6 +21,14 @@ COOKIE_FILE = './data/cookies.txt'
 STANDARD_API_LIMIT = 50 * 1024 * 1024 - 1024 * 1024  # 49MB
 LOCAL_API_LIMIT = 2000 * 1024 * 1024 - 1024 * 1024 * 50  # ~1.95GB
 
+
+def env_flag(name, default=False):
+    """Read a boolean environment variable with a predictable fallback."""
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ('1', 'true', 'yes', 'on')
+
 def load_config():
     """Load configuration from environment variables."""
     return {
@@ -32,6 +40,10 @@ def load_config():
         'allowed_chat_ids': os.getenv('ALLOWED_CHAT_IDS', ''),
         'max_disk_gb': float(os.getenv('MAX_DISK_GB', '0')),
         'subscription_check_interval': int(os.getenv('SUBSCRIPTION_CHECK_INTERVAL', '300')),  # 5 minutes
+        'ytdlp_auto_update': env_flag('YTDLP_AUTO_UPDATE', True),
+        'ytdlp_daily_update': env_flag('YTDLP_DAILY_UPDATE', True),
+        'ytdlp_update_time': os.getenv('YTDLP_UPDATE_TIME', '04:00'),
+        'ytdlp_update_timezone': os.getenv('YTDLP_UPDATE_TIMEZONE', 'Asia/Taipei'),
     }
 
 def get_ffmpeg_command():

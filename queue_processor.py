@@ -7,14 +7,35 @@ import logging
 import glob
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import RetryAfter, TelegramError
 
 from config import load_config, check_disk_space, check_ffmpeg, DOWNLOAD_DIR, get_ffmpeg_command, get_proxy_list, get_cookie_file
 from downloader import download_content, get_video_info, get_playlist_info
 from uploader import upload_video_streaming, upload_audio_streaming, split_video, crop_to_square
 from handlers import cancelled_tasks, stopped_tasks, fromstart_tasks
+from telegram_utils import tg_retry
 
 logger = logging.getLogger(__name__)
+
+# Live recordings run outside the request queue processor and need explicit
+# tracking so maintenance never starts while they are active.
+active_live_tasks = set()
+
+
+def has_active_downloads(request_queue, playlist_queue):
+    """Return whether a queued, processing, uploading, or live task exists."""
+    request_active = getattr(request_queue, '_unfinished_tasks', 0)
+    playlist_active = getattr(playlist_queue, '_unfinished_tasks', 0)
+    return bool(request_active or playlist_active or active_live_tasks)
+
+
+async def process_live_stream_tracked(*args):
+    """Track a detached live recording for daily maintenance decisions."""
+    task_id = args[5]
+    active_live_tasks.add(task_id)
+    try:
+        await process_live_stream(*args)
+    finally:
+        active_live_tasks.discard(task_id)
 
 def _free_memory():
     """Force garbage collection and release memory back to OS via glibc malloc_trim."""
@@ -36,29 +57,6 @@ def _cleanup_partial_downloads():
             if not has_video:
                 try: os.remove(f)
                 except: pass
-
-async def tg_retry(func, *args, **kwargs):
-    """Retry Telegram API calls up to 10 times on RateLimit."""
-    max_retries = 10
-    for attempt in range(max_retries):
-        try:
-            return await func(*args, **kwargs)
-        except RetryAfter as e:
-            wait_time = e.retry_after
-            logger.warning(f"Flood control: Waiting {wait_time}s (Attempt {attempt+1}/10)")
-            await asyncio.sleep(wait_time)
-        except TelegramError as e:
-            if "Flood control" in str(e):
-                logger.warning(f"Flood caught via error msg: {e} (Attempt {attempt+1}/10)")
-                await asyncio.sleep(5)
-                continue
-            raise e
-        except Exception as e:
-            if attempt == max_retries - 1:
-                raise e
-            logger.warning(f"Unexpected error in tg_retry: {e}. Retrying...")
-            await asyncio.sleep(2)
-    raise Exception("Max retries exceeded for Telegram API call")
 
 async def handle_upload(application, chat_id, file_path, title, url, audio_only=False, update_status_func=None, channel_name=None, reply_to_message_id=None, thumb_path=None):
     """Helper to handle video/audio upload with splitting and cleanup."""
@@ -239,7 +237,7 @@ async def process_queue(application, request_queue):
 
             # Initial Live Detection (from queue flag)
             if is_live:
-                asyncio.create_task(process_live_stream(application, chat_id, url, message_id, status_msg, task_id, update_status_msg, channel_name))
+                asyncio.create_task(process_live_stream_tracked(application, chat_id, url, message_id, status_msg, task_id, update_status_msg, channel_name))
                 continue
                 
             await update_status_msg(f"🚀 Processing: {url}", force=True, show_cancel=True)
@@ -259,7 +257,7 @@ async def process_queue(application, request_queue):
                 if video_info.get('is_live'):
                     logger.info(f"URL detected as LIVE during info check: {url}")
                     channel_name = channel_name or video_info.get('uploader') or video_info.get('title', 'Live')
-                    asyncio.create_task(process_live_stream(application, chat_id, url, message_id, status_msg, task_id, update_status_msg, channel_name))
+                    asyncio.create_task(process_live_stream_tracked(application, chat_id, url, message_id, status_msg, task_id, update_status_msg, channel_name))
                     continue
             except asyncio.TimeoutError:
                 logger.warning(f"Timeout checking info for {url}, proceeding with defaults")

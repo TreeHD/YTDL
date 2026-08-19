@@ -22,6 +22,8 @@ from downloader import (
     get_channel_info, get_playlist_info, is_playlist
 )
 from uploader import upload_video_streaming, upload_audio_streaming, split_video, crop_to_square
+from telegram_utils import tg_retry
+from upgrader import upgrade_yt_dlp
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +60,9 @@ Send me a URL to download in 1080p (default).
 **Playlist Command:**
 • `/playlist <URL>` - Download entire playlist
 
+**Maintenance Command:**
+• `/upgrade` - Upgrade yt-dlp to the nightly channel
+
 **Subscription Commands:**
 • `/subscribe <channel_url>` - Subscribe to a channel
 • `/unsubscribe <channel_url>` - Unsubscribe from a channel
@@ -66,6 +71,53 @@ Send me a URL to download in 1080p (default).
 Or just send a URL directly for 1080p video.
 """
     await context.bot.send_message(chat_id=chat_id, text=help_text, parse_mode='Markdown')
+
+
+async def handle_upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /upgrade by updating yt-dlp without blocking the bot event loop."""
+    chat_id = update.effective_chat.id
+    message_id = update.message.message_id
+
+    if not is_user_allowed(chat_id):
+        await tg_retry(
+            context.bot.send_message,
+            chat_id=chat_id,
+            text="Sorry, you are not authorized.",
+            reply_to_message_id=message_id,
+        )
+        return
+
+    has_active_downloads = context.application.bot_data.get(
+        'has_active_downloads'
+    )
+    if has_active_downloads and has_active_downloads():
+        await tg_retry(
+            context.bot.send_message,
+            chat_id=chat_id,
+            text=(
+                "⛔ yt-dlp upgrade blocked because a download task is active. "
+                "Please try again after all tasks finish."
+            ),
+            reply_to_message_id=message_id,
+        )
+        return
+
+    status_msg = await tg_retry(
+        context.bot.send_message,
+        chat_id=chat_id,
+        text="⬆️ Upgrading yt-dlp to nightly...",
+        reply_to_message_id=message_id,
+    )
+    loop = asyncio.get_running_loop()
+    success, output = await loop.run_in_executor(None, upgrade_yt_dlp)
+
+    # Telegram messages are limited to 4096 characters; retain the useful tail.
+    output = output[-3500:]
+    if success:
+        text = f"✅ yt-dlp nightly upgrade completed.\n\n{output}"
+    else:
+        text = f"❌ yt-dlp nightly upgrade failed.\n\n{output}"
+    await tg_retry(status_msg.edit_text, text)
 
 async def handle_music_command(update: Update, context: ContextTypes.DEFAULT_TYPE, request_queue):
     """Handle /music command for audio-only downloads."""
@@ -551,7 +603,6 @@ async def audio_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if is_local_api:
             await upload_audio_streaming(bot_token, api_url, chat_id, file_path, title, full_caption, reply_to_message_id=reply_id, thumb_path=thumb_path)
         else:
-            from queue_processor import tg_retry
             # Attempt to reply to the original user source message
             with open(file_path, 'rb') as f:
                 if thumb_path and os.path.exists(thumb_path):

@@ -43,5 +43,20 @@ class TestConfig(unittest.TestCase):
             self.assertTrue(is_user_allowed(456))
             self.assertFalse(is_user_allowed(789))
 
+    def test_ytdlp_auto_update_defaults_to_enabled(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(load_config()['ytdlp_auto_update'])
+
+    def test_ytdlp_auto_update_can_be_disabled(self):
+        with patch.dict(os.environ, {'YTDLP_AUTO_UPDATE': 'false'}, clear=True):
+            self.assertFalse(load_config()['ytdlp_auto_update'])
+
+    def test_daily_update_defaults(self):
+        with patch.dict(os.environ, {}, clear=True):
+            config = load_config()
+            self.assertTrue(config['ytdlp_daily_update'])
+            self.assertEqual(config['ytdlp_update_time'], '04:00')
+            self.assertEqual(config['ytdlp_update_timezone'], 'Asia/Taipei')
+
 if __name__ == '__main__':
     unittest.main()

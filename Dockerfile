@@ -4,7 +4,7 @@ FROM python:3.14-slim
 WORKDIR /app
 
 # Install system dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg unzip wget && \
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg unzip wget tzdata && \
     rm -rf /var/lib/apt/lists/*
 
 # Install deno
@@ -27,6 +27,9 @@ COPY uploader.py .
 COPY handlers.py .
 COPY queue_processor.py .
 COPY subscription.py .
+COPY telegram_utils.py .
+COPY upgrader.py .
+COPY docker-entrypoint.sh .
 
 # Create data directory for SQLite
 RUN mkdir -p /app/data /app/downloads
@@ -34,4 +37,6 @@ RUN mkdir -p /app/data /app/downloads
 ENV PYTHONMALLOC=malloc
 ENV PATH="/opt/deno/bin:${PATH}"
 
-CMD ["python", "bot.py"]
+RUN chmod +x /app/docker-entrypoint.sh
+
+ENTRYPOINT ["/app/docker-entrypoint.sh"]

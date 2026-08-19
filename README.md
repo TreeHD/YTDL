@@ -53,12 +53,25 @@ Telegram bot for downloading videos and audio from YouTube and other yt-dlp supp
 | `/subscribe <url> [quality]` | Subscribe to channel |
 | `/unsubscribe <url>` | Unsubscribe from channel |
 | `/subscriptions`, `/subs` | List subscriptions |
+| `/upgrade` | Upgrade yt-dlp to nightly when no download task is active |
 
 Sending a URL directly downloads at 1080p by default.
 
 ## Configuration
 
 See [`.env.example`](.env.example) for all available options.
+
+yt-dlp is upgraded to the nightly channel before the bot starts by default.
+Set `YTDLP_AUTO_UPDATE=false` to disable the startup upgrade. The `/upgrade`
+command remains available to authorized users regardless of this setting.
+The command refuses to run while any queued, downloading, uploading, playlist,
+or live task is active.
+
+The bot also checks for a nightly update every day at `04:00` in
+`Asia/Taipei`. Configure this with `YTDLP_UPDATE_TIME` (`HH:MM`) and
+`YTDLP_UPDATE_TIMEZONE` (IANA timezone name), or disable it with
+`YTDLP_DAILY_UPDATE=false`. If any queued, downloading, uploading, or live task
+is active at the scheduled time, that day's update is skipped until tomorrow.
 
 ### Proxy Setup
 
