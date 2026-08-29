@@ -15,13 +15,20 @@ import urllib.request
 import urllib.error
 import time
 
-# --- Errors that trigger proxy rotation ---
-RETRY_ERRORS = [
-    'Video unavailable',
+# Geo restrictions should move directly to the next proxy.  Rotating WARP for
+# these is wasteful: the current IP may be valid for other videos and another
+# configured proxy may already be in an allowed region.
+GEO_RESTRICTION_ERRORS = [
     'is not available in your country',
     'not made this video available in your country',
     'available in your country',
     'geo',
+    'country',
+]
+
+# --- Errors that trigger proxy rotation ---
+RETRY_ERRORS = [
+    'Video unavailable',
     'blocked',
     'This video is not available',
     'content is not available',
@@ -29,7 +36,6 @@ RETRY_ERRORS = [
     'Private video',
     'removed by the uploader',
     'uploader has not made this video available',
-    'country',
     'bot',
     'cookies are required',
     'Sign in to confirm you\'re not a bot',
@@ -56,12 +62,19 @@ def restart_warp_proxy():
     return False
 
 def is_retryable_error(error_msg, proxy_url=None):
-    """Check if error should trigger proxy rotation. Restarts WARP on any failure through warp-proxy."""
+    """Return whether to try another proxy, rotating WARP only when appropriate."""
     error_lower = str(error_msg).lower()
-    matched = any(pattern.lower() in error_lower for pattern in RETRY_ERRORS)
+    is_geo_restriction = any(
+        pattern.lower() in error_lower for pattern in GEO_RESTRICTION_ERRORS
+    )
+    matched = is_geo_restriction or any(
+        pattern.lower() in error_lower for pattern in RETRY_ERRORS
+    )
     if matched:
         logger.info(f"Retryable error matched: {error_msg[:100]}")
-        if proxy_url and 'warp-proxy' in proxy_url:
+        if is_geo_restriction:
+            logger.info("Geo restriction detected; trying the next proxy without rotating WARP.")
+        elif proxy_url and 'warp-proxy' in proxy_url:
             restart_warp_proxy()
     return matched
 
