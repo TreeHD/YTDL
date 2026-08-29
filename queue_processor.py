@@ -20,6 +20,12 @@ logger = logging.getLogger(__name__)
 # tracking so maintenance never starts while they are active.
 active_live_tasks = set()
 
+# The live-edge recorder is only a temporary safety net while the archive from
+# the beginning proves it can keep recording.  After this interval, keeping
+# both recorders would only create duplicate uploads.
+LIVE_FROM_START_STABILITY_SECONDS = 10 * 60
+LIVE_FROM_START_MAX_DATA_GAP_SECONDS = 30
+
 
 def has_active_downloads(request_queue, playlist_queue):
     """Return whether a queued, processing, uploading, or live task exists."""
@@ -345,15 +351,17 @@ async def _kill_process(process, task_id):
         logger.error(f"[LIVE:{task_id}] _kill_process error: {e}", exc_info=True)
 
 async def process_live_stream(application, chat_id, url, message_id, status_msg, task_id, update_status_msg, channel_name):
-    """Record a live stream from now while archiving its DVR from the beginning.
+    """Use the live edge as a temporary backup while archiving from the start.
 
     streamlink protects the live edge when YouTube has no VOD/DVR available,
-    while yt-dlp's independent --live-from-start process captures the archive
-    whenever it is available.
+    while yt-dlp's independent --live-from-start process captures the archive.
+    Once the archive is healthy for ten minutes, stop and discard the duplicate
+    live-edge recording.
     """
     SEGMENT_SIZE_BYTES = 1900 * 1024 * 1024  # 1.9GB per segment
     logger.info(f"[LIVE:{task_id}] START url={url}, chat_id={chat_id}, channel={channel_name}")
     fromstart_upload_tasks = []
+    fromstart_stable = asyncio.Event()
 
     def _make_keyboard():
         return InlineKeyboardMarkup([[
@@ -454,6 +462,8 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
         seg_bytes = 0
         total_bytes = 0
         start_time = time.time()
+        first_data_time = None
+        last_data_time = None
         got_data = False
         cancelled = False
 
@@ -483,6 +493,16 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                         logger.warning(f"[LIVE:{bg_id}] No data after {elapsed:.0f}s, VOD likely unavailable")
                         await _kill_process(proc, bg_id)
                         return False
+                    if (
+                        first_data_time is not None
+                        and last_data_time is not None
+                        and time.monotonic() - last_data_time > LIVE_FROM_START_MAX_DATA_GAP_SECONDS
+                    ):
+                        logger.warning(
+                            f"[LIVE:{bg_id}] No archive data for over "
+                            f"{LIVE_FROM_START_MAX_DATA_GAP_SECONDS}s; resetting stability timer"
+                        )
+                        first_data_time = None
                     continue
 
                 if not chunk:
@@ -490,6 +510,19 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                     break
 
                 got_data = True
+                data_time = time.monotonic()
+                if first_data_time is None:
+                    first_data_time = data_time
+                elif (
+                    not fromstart_stable.is_set()
+                    and data_time - first_data_time >= LIVE_FROM_START_STABILITY_SECONDS
+                ):
+                    fromstart_stable.set()
+                    logger.info(
+                        f"[LIVE:{bg_id}] From-start archive stable for "
+                        f"{LIVE_FROM_START_STABILITY_SECONDS}s; retiring live-edge backup"
+                    )
+                last_data_time = data_time
                 total_bytes += len(chunk)
 
                 # Open new segment file if needed
@@ -770,8 +803,9 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
         uploaded_segments = []
         consecutive_failures = 0
         bg_tasks = []
+        live_edge_retired = False
         # Start this before streamlink.  It must never replace or interrupt the
-        # live-edge recorder: no DVR/VOD is a normal condition for a live.
+        # live-edge recorder until the DVR/VOD stability window has passed.
         fromstart_task = asyncio.create_task(_download_from_start())
         bg_tasks.append(fromstart_task)
 
@@ -810,6 +844,25 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
         poll_count = 0
 
         while True:
+            if fromstart_stable.is_set():
+                logger.info(
+                    f"[LIVE:{task_id}] From-start archive is stable; "
+                    "stopping and discarding the duplicate live-edge backup"
+                )
+                await _kill_process(process, task_id)
+                for part_path in part_files:
+                    try:
+                        os.remove(part_path)
+                    except Exception:
+                        pass
+                part_files = []
+                live_edge_retired = True
+                await live_status(
+                    f"✅ From-start archive is stable: {channel_name}\n"
+                    "⏹ Live-edge backup stopped; continuing from the beginning only."
+                )
+                break
+
             if process.returncode is not None:
                 logger.info(f"[LIVE:{task_id}] streamlink exited rc={process.returncode}")
 
@@ -1065,10 +1118,16 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
         if bg_tasks:
             logger.info(f"[LIVE:{task_id}] Waiting for {len(bg_tasks)} background tasks...")
             if not fromstart_task.done():
-                await update_status_msg(
-                    "⬆️ Uploading live segment(s) and completing the from-start archive...",
-                    force=True,
-                )
+                if live_edge_retired:
+                    await live_status(
+                        f"⏪ Archiving from the beginning: {channel_name}\n"
+                        "✅ Live-edge backup was stopped after the 10-minute safety check."
+                    )
+                else:
+                    await update_status_msg(
+                        "⬆️ Uploading live segment(s) and completing the from-start archive...",
+                        force=True,
+                    )
             else:
                 await update_status_msg(f"⬆️ Uploading {len(bg_tasks)} segment(s)...", force=True)
             await asyncio.gather(*bg_tasks, return_exceptions=True)

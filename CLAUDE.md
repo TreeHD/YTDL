@@ -35,7 +35,7 @@ A Telegram bot that downloads videos/audio via yt-dlp, runs as a Docker containe
 - **Proxy rotation**: `get_proxy_list()` returns ordered list. On retryable errors, iterate to next proxy. WARP proxy failures trigger `/restart` endpoint for IP rotation.
 - **yt-dlp is synchronous**: Always wrap in `loop.run_in_executor(None, lambda: ...)`.
 - **Memory management**: `PYTHONMALLOC=malloc` in Dockerfile (musl returns pages to OS on free). `_free_memory()` called after every task.
-- **Live stream recording**: Starts streamlink for the live edge and yt-dlp `--live-from-start` in parallel. A missing DVR/VOD only stops the from-start archive; the live-edge recorder continues. Both use 1.9GB segments. Graceful shutdown: SIGINT → SIGTERM → SIGKILL.
+- **Live stream recording**: Starts streamlink for the live edge and yt-dlp `--live-from-start` in parallel. If the from-start archive records normally for 10 minutes, streamlink is stopped and its duplicate temporary files are discarded; only the full from-start archive continues. A missing DVR/VOD only stops the from-start archive, so the live-edge recorder remains as the fallback. Both use 1.9GB segments. Graceful shutdown: SIGINT → SIGTERM → SIGKILL.
 
 ### Environment & Config
 
