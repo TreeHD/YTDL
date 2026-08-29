@@ -33,9 +33,6 @@ cancelled_tasks = set()
 # Track "stop & upload" requests for live recordings
 stopped_tasks = set()
 
-# Track "download from start" requests for live recordings (background)
-fromstart_tasks = set()
-
 # --- Command Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start and /help commands."""
@@ -538,16 +535,9 @@ async def stop_live_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def fromstart_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle 'From Start' button — download from beginning in background."""
+    """Handle stale From Start buttons from recordings created before auto-archive."""
     query = update.callback_query
-    await query.answer("Downloading from start in background...")
-
-    data = query.data
-    if not data.startswith("fromstart:"):
-        return
-
-    task_id = data[10:]
-    fromstart_tasks.add(task_id)
+    await tg_retry(query.answer, "From-start archive is already running.")
 
 async def audio_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle Audio download button callback."""
