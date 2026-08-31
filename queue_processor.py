@@ -5,12 +5,22 @@ import asyncio
 import time
 import logging
 import glob
+import itertools
+import secrets
+from dataclasses import dataclass, field
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from config import load_config, check_disk_space, check_ffmpeg, DOWNLOAD_DIR, get_ffmpeg_command, get_proxy_list, get_cookie_file
 from downloader import download_content, get_video_info, get_playlist_info
-from uploader import upload_video_streaming, upload_audio_streaming, split_video, crop_to_square
+from uploader import (
+    upload_video_streaming,
+    upload_audio_streaming,
+    split_video,
+    crop_to_square,
+    UploadRetryableError,
+    UploadPermanentError,
+)
 from handlers import cancelled_tasks, stopped_tasks
 from telegram_utils import tg_retry
 
@@ -26,12 +36,357 @@ active_live_tasks = set()
 LIVE_FROM_START_STABILITY_SECONDS = 10 * 60
 LIVE_FROM_START_MAX_DATA_GAP_SECONDS = 30
 
+# Upload retries are deliberately separate from the download queue.  A Telegram
+# flood-control delay must never keep every later download waiting behind it.
+UPLOAD_RETRY_WINDOW_SECONDS = 24 * 60 * 60
+UPLOAD_RETRY_MAX_DELAY_SECONDS = 15 * 60
+_upload_retry_queue = None
+_upload_retry_wakeup = None
+_upload_retry_jobs = {}
+_upload_retry_counter = itertools.count()
+_upload_retry_tasks = set()
+
+
+@dataclass
+class UploadJob:
+    """An in-memory, resumable upload of one media item or its split parts."""
+
+    application: object
+    chat_id: int
+    source_file_path: str
+    files_to_upload: list
+    title: str
+    url: str
+    audio_only: bool = False
+    update_status_func: object = None
+    channel_name: str = None
+    reply_to_message_id: int = None
+    thumb_path: str = None
+    allow_audio_download: bool = True
+    job_id: str = field(default_factory=lambda: secrets.token_urlsafe(8))
+    next_part_index: int = 0
+    retry_deadline: float = None
+    retry_count: int = 0
+    retry_generation: int = 0
+    running: bool = False
+    completed: bool = False
+    auto_retry_expired: bool = False
+
+
+def _safe_remove(path):
+    if not path:
+        return
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception as exc:
+        logger.warning("Failed to remove temporary upload file %s: %s", path, exc)
+
+
+async def _update_upload_job_status(job, text, show_retry=False):
+    """Update the request's one status message, where one is available."""
+    if not job.update_status_func:
+        return
+    try:
+        if show_retry:
+            await job.update_status_func(text, force=True, retry_job_id=job.job_id)
+        else:
+            await job.update_status_func(text, force=True)
+    except TypeError:
+        # Live and older call sites do not expose inline keyboard support.
+        await job.update_status_func(text, force=True)
+    except Exception as exc:
+        logger.warning("Failed to update upload status for %s: %s", job.job_id, exc)
+
+
+def _retry_delay(error, retry_count):
+    if isinstance(error, UploadRetryableError) and error.retry_after is not None:
+        return max(0, error.retry_after)
+    return min(60 * (2 ** min(retry_count, 4)), UPLOAD_RETRY_MAX_DELAY_SECONDS)
+
+
+async def _schedule_upload_retry(job, error):
+    """Keep failed media on disk and schedule its next background attempt."""
+    global _upload_retry_queue, _upload_retry_wakeup
+
+    if isinstance(error, UploadPermanentError):
+        job.auto_retry_expired = True
+        await _update_upload_job_status(
+            job,
+            (
+                f"❌ Upload rejected at part {job.next_part_index + 1}/{len(job.files_to_upload)}: {error}\n"
+                "Files are kept; correct the problem, then use Retry upload now."
+            ),
+            show_retry=True,
+        )
+        return
+
+    now = time.monotonic()
+    if job.retry_deadline is None:
+        job.retry_deadline = now + UPLOAD_RETRY_WINDOW_SECONDS
+
+    if now >= job.retry_deadline:
+        job.auto_retry_expired = True
+        await _update_upload_job_status(
+            job,
+            (
+                f"❌ Upload paused at part {job.next_part_index + 1}/{len(job.files_to_upload)}.\n"
+                "Automatic retries stopped after 24 hours; files are kept."
+            ),
+            show_retry=True,
+        )
+        return
+
+    job.retry_count += 1
+    job.auto_retry_expired = False
+    delay = _retry_delay(error, job.retry_count - 1)
+    due_at = min(now + delay, job.retry_deadline)
+    job.retry_generation += 1
+
+    if _upload_retry_queue is None:
+        logger.error("Upload retry worker is unavailable; keeping job %s for manual retry", job.job_id)
+        await _update_upload_job_status(
+            job,
+            f"❌ Upload failed for part {job.next_part_index + 1}/{len(job.files_to_upload)}: {error}\nFiles are kept.",
+            show_retry=True,
+        )
+        return
+
+    await _upload_retry_queue.put((due_at, next(_upload_retry_counter), job.job_id, job.retry_generation))
+    if _upload_retry_wakeup:
+        _upload_retry_wakeup.set()
+    await _update_upload_job_status(
+        job,
+        (
+            f"⚠️ Upload failed for part {job.next_part_index + 1}/{len(job.files_to_upload)}: {error}\n"
+            f"⏳ Retrying automatically in {int(max(0, due_at - now))} seconds; files are kept."
+        ),
+        show_retry=True,
+    )
+
+
+def _caption_for_upload_part(job, part_index):
+    if job.channel_name:
+        caption = f"{job.channel_name}\n{job.title}\n{job.url}"
+    else:
+        caption = f"{job.title}\n{job.url}"
+
+    if len(job.files_to_upload) > 1:
+        if job.channel_name:
+            caption = f"{job.channel_name}\n{job.title} (Part {part_index + 1}/{len(job.files_to_upload)})\n{job.url}"
+        else:
+            caption = f"{job.title} (Part {part_index + 1}/{len(job.files_to_upload)})\n{job.url}"
+    return caption
+
+
+def _upload_reply_markups(url, allow_audio_download=True):
+    """Build the optional audio-download button for non-live uploads only."""
+    if not allow_audio_download:
+        return None, None
+    audio_cb_data = f"audio:{url}"
+    if len(audio_cb_data.encode('utf-8')) > 64:
+        return None, None
+    return (
+        {"inline_keyboard": [[{"text": "🎵 Download Audio", "callback_data": audio_cb_data}]]},
+        InlineKeyboardMarkup([[InlineKeyboardButton("🎵 Download Audio", callback_data=audio_cb_data)]]),
+    )
+
+
+async def _upload_one_part(job, part_index):
+    """Send exactly one part; raw uploads perform their own bounded retries."""
+    file_path = job.files_to_upload[part_index]
+    if not os.path.exists(file_path):
+        raise UploadPermanentError(f"Upload file is missing: {file_path}")
+
+    config = load_config()
+    api_url = config.get('api_url', '')
+    bot_token = config.get('bot_token', '')
+    is_local_api = api_url and 'api.telegram.org' not in api_url
+    caption = _caption_for_upload_part(job, part_index)
+
+    if job.audio_only:
+        if is_local_api:
+            await upload_audio_streaming(
+                bot_token, api_url, job.chat_id, file_path, job.title, caption,
+                reply_to_message_id=job.reply_to_message_id, thumb_path=job.thumb_path,
+                max_retries=1,
+            )
+            return
+
+        with open(file_path, 'rb') as media_fh:
+            thumb_fh = None
+            try:
+                if job.thumb_path and os.path.exists(job.thumb_path):
+                    thumb_fh = open(crop_to_square(job.thumb_path), 'rb')
+                await tg_retry(
+                    job.application.bot.send_audio,
+                    chat_id=job.chat_id,
+                    audio=media_fh,
+                    title=job.title,
+                    caption=caption,
+                    reply_to_message_id=job.reply_to_message_id,
+                    thumbnail=thumb_fh,
+                )
+            finally:
+                if thumb_fh:
+                    thumb_fh.close()
+        return
+
+    raw_markup, telegram_markup = _upload_reply_markups(
+        job.url, allow_audio_download=job.allow_audio_download
+    )
+    if is_local_api:
+        await upload_video_streaming(
+            bot_token, api_url, job.chat_id, file_path, caption, raw_markup,
+            reply_to_message_id=job.reply_to_message_id, thumb_path=job.thumb_path,
+            max_retries=1,
+        )
+        return
+
+    with open(file_path, 'rb') as media_fh:
+        thumb_fh = None
+        try:
+            if job.thumb_path and os.path.exists(job.thumb_path):
+                thumb_fh = open(crop_to_square(job.thumb_path), 'rb')
+            await tg_retry(
+                job.application.bot.send_video,
+                chat_id=job.chat_id,
+                video=media_fh,
+                caption=caption,
+                supports_streaming=True,
+                reply_markup=telegram_markup,
+                reply_to_message_id=job.reply_to_message_id,
+                thumbnail=thumb_fh,
+            )
+        finally:
+            if thumb_fh:
+                thumb_fh.close()
+
+
+def _cleanup_completed_upload(job):
+    """Delete artifacts only after every part has reached Telegram."""
+    paths = set(job.files_to_upload)
+    paths.add(job.source_file_path)
+    if job.thumb_path:
+        paths.add(job.thumb_path)
+    for path in paths:
+        _safe_remove(path)
+
+
+async def _execute_upload_job(job):
+    """Run a job from its first unfinished part through completion or deferral."""
+    try:
+        while job.next_part_index < len(job.files_to_upload):
+            part_number = job.next_part_index + 1
+            await _update_upload_job_status(
+                job,
+                f"⬆️ Uploading {'audio' if job.audio_only else f'part {part_number}/{len(job.files_to_upload)}'}...",
+            )
+            try:
+                await _upload_one_part(job, job.next_part_index)
+            except Exception as exc:
+                logger.error("Upload failed for job %s part %s: %s", job.job_id, part_number, exc)
+                await _schedule_upload_retry(job, exc)
+                return False
+            job.next_part_index += 1
+
+        await _update_upload_job_status(job, "🧹 Cleaning up...", show_retry=False)
+        _cleanup_completed_upload(job)
+        job.completed = True
+        _upload_retry_jobs.pop(job.job_id, None)
+        await _update_upload_job_status(job, "✅ Upload complete.", show_retry=False)
+        return True
+    finally:
+        job.running = False
+
+
+async def _run_upload_job(job):
+    if job.running or job.completed:
+        return False
+    job.running = True
+    return await _execute_upload_job(job)
+
+
+async def process_upload_retry_queue():
+    """Run one deferred upload at a time, leaving the download queue unblocked."""
+    logger.info("Upload retry worker started.")
+    while True:
+        due_at, _, job_id, generation = await _upload_retry_queue.get()
+        try:
+            wait_seconds = due_at - time.monotonic()
+            requeued_for_earlier_job = False
+            if wait_seconds > 0:
+                try:
+                    # A newly scheduled job may have an earlier due time than
+                    # this one.  Wake and put this entry back so PriorityQueue
+                    # can choose the right job instead of sleeping past it.
+                    await asyncio.wait_for(_upload_retry_wakeup.wait(), timeout=wait_seconds)
+                    _upload_retry_wakeup.clear()
+                    await _upload_retry_queue.put((due_at, next(_upload_retry_counter), job_id, generation))
+                    requeued_for_earlier_job = True
+                except asyncio.TimeoutError:
+                    pass
+
+            if requeued_for_earlier_job:
+                continue
+
+            job = _upload_retry_jobs.get(job_id)
+            if not job or job.completed or job.running or job.retry_generation != generation:
+                continue
+            await _run_upload_job(job)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("Upload retry worker error for %s: %s", job_id, exc)
+        finally:
+            _upload_retry_queue.task_done()
+
+
+def start_upload_retry_worker():
+    """Create the in-memory retry queue and return its single worker task."""
+    global _upload_retry_queue, _upload_retry_wakeup
+    _upload_retry_queue = asyncio.PriorityQueue()
+    _upload_retry_wakeup = asyncio.Event()
+    return asyncio.create_task(process_upload_retry_queue())
+
+
+async def stop_upload_retry_tasks():
+    """Stop user-triggered immediate retry tasks during bot shutdown."""
+    tasks = list(_upload_retry_tasks)
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def retry_upload_job(job_id):
+    """Request an immediate retry from the status-message callback."""
+    job = _upload_retry_jobs.get(job_id)
+    if not job or job.completed:
+        return False, "This upload is no longer available."
+    if job.running:
+        return False, "Upload retry is already in progress."
+
+    # Invalidate a delayed queue entry.  The direct task starts now rather
+    # than waiting for the retry worker to wake for its old due time.
+    job.retry_generation += 1
+    job.auto_retry_expired = False
+    # Mark it running before yielding so double-taps cannot start two uploads
+    # of the same Telegram part.
+    job.running = True
+    task = asyncio.create_task(_execute_upload_job(job))
+    _upload_retry_tasks.add(task)
+    task.add_done_callback(_upload_retry_tasks.discard)
+    return True, "Retrying upload now."
+
 
 def has_active_downloads(request_queue, playlist_queue):
     """Return whether a queued, processing, uploading, or live task exists."""
     request_active = getattr(request_queue, '_unfinished_tasks', 0)
     playlist_active = getattr(playlist_queue, '_unfinished_tasks', 0)
-    return bool(request_active or playlist_active or active_live_tasks)
+    retry_upload_active = any(not job.completed for job in _upload_retry_jobs.values())
+    return bool(request_active or playlist_active or retry_upload_active or active_live_tasks)
 
 
 async def process_live_stream_tracked(*args):
@@ -64,127 +419,51 @@ def _cleanup_partial_downloads():
                 try: os.remove(f)
                 except: pass
 
-async def handle_upload(application, chat_id, file_path, title, url, audio_only=False, update_status_func=None, channel_name=None, reply_to_message_id=None, thumb_path=None):
-    """Helper to handle video/audio upload with splitting and cleanup."""
+async def handle_upload(application, chat_id, file_path, title, url, audio_only=False, update_status_func=None, channel_name=None, reply_to_message_id=None, thumb_path=None, allow_audio_download=True):
+    """Upload media now, or retain it and defer retries after a failure.
+
+    Returns ``True`` only when all parts are delivered and cleanup is complete.
+    A ``False`` result means the retry worker owns the retained files.
+    """
     try:
         if audio_only:
-            if update_status_func:
-                await update_status_func("⬆️ Uploading audio...", force=True)
-            
-            config = load_config()
-            api_url = config.get('api_url', '')
-            bot_token = config.get('bot_token', '')
-            is_local_api = api_url and 'api.telegram.org' not in api_url
-            
-            if channel_name:
-                full_caption = f"{channel_name}\n{title}\n{url}"
-            else:
-                full_caption = f"{title}\n{url}"
-            if is_local_api:
-                await upload_audio_streaming(bot_token, api_url, chat_id, file_path, title, full_caption, reply_to_message_id=reply_to_message_id, thumb_path=thumb_path)
-            else:
-                with open(file_path, 'rb') as f:
-                    if thumb_path and os.path.exists(thumb_path):
-                        thumb_path = crop_to_square(thumb_path)
-                        thumb = open(thumb_path, 'rb')
-                    else:
-                        thumb = None
-                    await tg_retry(application.bot.send_audio, chat_id=chat_id, audio=f, title=title, caption=full_caption, reply_to_message_id=reply_to_message_id, thumbnail=thumb)
-                    if thumb: thumb.close()
-            
-            if os.path.exists(file_path):
-                os.remove(file_path)
-        
+            files_to_upload = [file_path]
         else:
-            # Video upload with splitting
             if update_status_func:
                 await update_status_func("✂️ Checking file size...", force=True)
-            
             loop = asyncio.get_running_loop()
             if not check_ffmpeg():
                 files_to_upload = [file_path]
             else:
                 files_to_upload = await loop.run_in_executor(None, split_video, file_path)
-            
-            total_parts = len(files_to_upload)
-            
-            for i, f_path in enumerate(files_to_upload):
-                if channel_name:
-                    caption = f"{channel_name}\n{title}\n{url}"
-                else:
-                    caption = f"{title}\n{url}"
-                    
-                if total_parts > 1:
-                    if channel_name:
-                        caption = f"{channel_name}\n{title} (Part {i+1}/{total_parts})\n{url}"
-                    else:
-                        caption = f"{title} (Part {i+1}/{total_parts})\n{url}"
-                
-                if update_status_func:
-                    await update_status_func(f"⬆️ Uploading part {i+1}/{total_parts}...", force=True)
-                
-                try:
-                    config = load_config()
-                    api_url = config.get('api_url', '')
-                    bot_token = config.get('bot_token', '')
-                    is_local_api = api_url and 'api.telegram.org' not in api_url
 
-                    # Only add audio button if callback_data fits Telegram's 64-byte limit
-                    audio_cb_data = f"audio:{url}"
-                    if len(audio_cb_data.encode('utf-8')) <= 64:
-                        reply_markup_dict = {"inline_keyboard": [[{"text": "🎵 Download Audio", "callback_data": audio_cb_data}]]}
-                        reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🎵 Download Audio", callback_data=audio_cb_data)]])
-                    else:
-                        reply_markup_dict = None
-                        reply_markup = None
-
-                    if is_local_api:
-                        await upload_video_streaming(bot_token, api_url, chat_id, f_path, caption, reply_markup_dict, reply_to_message_id=reply_to_message_id, thumb_path=thumb_path)
-                    else:
-                        with open(f_path, 'rb') as f:
-                            if thumb_path and os.path.exists(thumb_path):
-                                thumb_path = crop_to_square(thumb_path)
-                                thumb = open(thumb_path, 'rb')
-                            else:
-                                thumb = None
-
-                            await tg_retry(application.bot.send_video,
-                                chat_id=chat_id, video=f, caption=caption,
-                                supports_streaming=True, reply_markup=reply_markup,
-                                reply_to_message_id=reply_to_message_id,
-                                thumbnail=thumb
-                            )
-                            if thumb: thumb.close()
-                except Exception as e:
-                    logger.error(f"Upload failed for part {i+1}: {e}")
-                    await tg_retry(application.bot.send_message, chat_id=chat_id, text=f"❌ Upload failed for part {i+1}: {e}")
-            
-            # Cleanup
-            if thumb_path and os.path.exists(thumb_path):
-                os.remove(thumb_path)
-                
-            if update_status_func:
-                await update_status_func("🧹 Cleaning up...", force=True)
-            
-            if os.path.exists(file_path):
-                os.remove(file_path)
-            for f_path in files_to_upload:
-                if os.path.exists(f_path) and f_path != file_path:
-                    os.remove(f_path)
-                    
+        job = UploadJob(
+            application=application,
+            chat_id=chat_id,
+            source_file_path=file_path,
+            files_to_upload=files_to_upload,
+            title=title,
+            url=url,
+            audio_only=audio_only,
+            update_status_func=update_status_func,
+            channel_name=channel_name,
+            reply_to_message_id=reply_to_message_id,
+            thumb_path=thumb_path,
+            allow_audio_download=allow_audio_download,
+        )
+        _upload_retry_jobs[job.job_id] = job
+        completed = await _run_upload_job(job)
+        return completed
     except Exception as e:
         logger.error(f"Error in handle_upload: {e}")
         error_text = f"🔥 Upload error: {e}"
         if update_status_func:
             await update_status_func(error_text, force=True)
         else:
-            await application.bot.send_message(chat_id=chat_id, text=error_text)
-        if file_path and os.path.exists(file_path):
-            try: os.remove(file_path)
-            except: pass
-        if thumb_path and os.path.exists(thumb_path):
-            try: os.remove(thumb_path)
-            except: pass
+            await tg_retry(application.bot.send_message, chat_id=chat_id, text=error_text)
+        # Never remove media on an upload failure.  If construction failed
+        # before a job was registered, this is still safer than data loss.
+        return False
     finally:
         _free_memory()
 
@@ -219,16 +498,20 @@ async def process_queue(application, request_queue):
             status_msg = status_msg_passed
             last_edit_time = 0
             
-            async def update_status_msg(text, force=False, show_cancel=False):
+            async def update_status_msg(text, force=False, show_cancel=False, retry_job_id=None):
                 nonlocal status_msg, last_edit_time
                 now = time.time()
                 if not force and (now - last_edit_time < 20):
                     return
                 try:
-                    reply_markup = None
+                    keyboard = []
                     if show_cancel:
-                        keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{task_id}")]]
-                        reply_markup = InlineKeyboardMarkup(keyboard)
+                        keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{task_id}")])
+                    if retry_job_id:
+                        keyboard.append([
+                            InlineKeyboardButton("🔁 Retry upload now", callback_data=f"retryupload:{retry_job_id}")
+                        ])
+                    reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
                     if status_msg:
                         if status_msg.text != text:
                             await tg_retry(status_msg.edit_text, text, reply_markup=reply_markup)
@@ -304,7 +587,14 @@ async def process_queue(application, request_queue):
                     lambda: download_content(url, progress_cb, audio_only=audio_only, audio_format=audio_format, max_height=max_height, task_id=task_id, cancelled_tasks=cancelled_tasks)
                 )
                 # Upload using helper
-                await handle_upload(application, chat_id, file_path, title, url, audio_only, update_status_msg, channel_name, message_id, thumb_path)
+                upload_completed = await handle_upload(
+                    application, chat_id, file_path, title, url, audio_only,
+                    update_status_msg, channel_name, message_id, thumb_path,
+                )
+                if not upload_completed:
+                    # The retry worker owns the files and the status message.
+                    # Do not delete either while it is attempting recovery.
+                    continue
             except Exception as e:
                 # Cleanup potential partial files on failure
                 logger.error(f"Download failed for {url}: {e}")
@@ -632,7 +922,10 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                 if is_final:
                     title += " (End)"
                 logger.info(f"[LIVE:{bg_id}] Uploading seg {seg_num}: {os.path.getsize(mp4_path)/(1024*1024):.1f}MB")
-                await handle_upload(application, chat_id, mp4_path, title, url, False, None, channel_name, message_id)
+                await handle_upload(
+                    application, chat_id, mp4_path, title, url, False, None,
+                    channel_name, message_id, allow_audio_download=False,
+                )
                 logger.info(f"[LIVE:{bg_id}] Upload done seg {seg_num}")
             else:
                 logger.error(f"[LIVE:{bg_id}] Remux produced no output for seg {seg_num}")
@@ -717,7 +1010,10 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                 if is_final:
                     title += " (End)"
                 logger.info(f"[LIVE:{task_id}] BG uploading seg {seg_num}: {upload_size/(1024*1024):.1f}MB")
-                await handle_upload(application, chat_id, mp4_path, title, url, False, None, channel_name, message_id)
+                await handle_upload(
+                    application, chat_id, mp4_path, title, url, False, None,
+                    channel_name, message_id, allow_audio_download=False,
+                )
                 logger.info(f"[LIVE:{task_id}] BG upload done seg {seg_num}")
             else:
                 logger.warning(f"[LIVE:{task_id}] BG remux produced empty file seg {seg_num}")

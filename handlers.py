@@ -521,6 +521,27 @@ async def cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.warning(f"Could not delete cancel message: {e}")
 
 
+async def retry_upload_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Immediately resume a retained upload from its first failed part."""
+    query = update.callback_query
+    data = query.data or ""
+    if not data.startswith("retryupload:"):
+        return
+
+    chat_id = query.message.chat_id
+    if not is_user_allowed(chat_id):
+        await tg_retry(query.answer, "You are not authorized.", show_alert=True)
+        return
+
+    retry_func = context.application.bot_data.get('retry_upload_job')
+    if not retry_func:
+        await tg_retry(query.answer, "Upload retry is unavailable after restart.", show_alert=True)
+        return
+
+    started, message = await retry_func(data[len("retryupload:"):])
+    await tg_retry(query.answer, message, show_alert=not started)
+
+
 async def stop_live_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle stop & upload button for live recordings."""
     query = update.callback_query

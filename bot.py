@@ -21,10 +21,12 @@ from handlers import (
     handle_subscribe_video, handle_subscribe_live,
     handle_unsubscribe, handle_subscriptions, cancel_callback, audio_callback,
     handle_settings, settings_callback, stop_live_callback, fromstart_callback,
+    retry_upload_callback,
     handle_upgrade
 )
 from queue_processor import (
-    process_queue, process_playlist_queue, has_active_downloads
+    process_queue, process_playlist_queue, has_active_downloads,
+    start_upload_retry_worker, stop_upload_retry_tasks, retry_upload_job,
 )
 from subscription import SubscriptionMonitor
 from upgrader import daily_upgrade_loop
@@ -125,6 +127,7 @@ def main():
     
     # Callback handlers
     application.add_handler(CallbackQueryHandler(cancel_callback, pattern="^cancel:"))
+    application.add_handler(CallbackQueryHandler(retry_upload_callback, pattern="^retryupload:"))
     application.add_handler(CallbackQueryHandler(stop_live_callback, pattern="^stoplive:"))
     application.add_handler(CallbackQueryHandler(fromstart_callback, pattern="^fromstart:"))
     application.add_handler(CallbackQueryHandler(audio_callback, pattern="^audio:"))
@@ -134,6 +137,7 @@ def main():
     task_holders = {
         'queue_task': None,
         'playlist_task': None,
+        'upload_retry_task': None,
         'daily_upgrade_task': None,
         'subscription_monitor': None
     }
@@ -143,6 +147,7 @@ def main():
         # Store queues in bot_data for accessibility in handlers
         app.bot_data['request_queue'] = request_queue
         app.bot_data['playlist_queue'] = playlist_queue
+        app.bot_data['retry_upload_job'] = retry_upload_job
         app.bot_data['has_active_downloads'] = lambda: has_active_downloads(
             request_queue, playlist_queue
         )
@@ -150,6 +155,7 @@ def main():
         # Start queue processors
         task_holders['queue_task'] = asyncio.create_task(process_queue(app, request_queue))
         task_holders['playlist_task'] = asyncio.create_task(process_playlist_queue(app, playlist_queue))
+        task_holders['upload_retry_task'] = start_upload_retry_worker()
 
         if config.get('ytdlp_daily_update', True):
             task_holders['daily_upgrade_task'] = asyncio.create_task(
@@ -173,9 +179,11 @@ def main():
         monitor = task_holders.get('subscription_monitor')
         if monitor:
             await monitor.stop()
+
+        await stop_upload_retry_tasks()
         
         # Cancel queue tasks
-        for task_name in ['queue_task', 'playlist_task', 'daily_upgrade_task']:
+        for task_name in ['queue_task', 'playlist_task', 'upload_retry_task', 'daily_upgrade_task']:
             task = task_holders.get(task_name)
             if task and not task.done():
                 logger.info(f"Canceling {task_name}...")

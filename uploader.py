@@ -7,6 +7,7 @@ import os
 import json
 import logging
 import subprocess
+import asyncio
 import aiohttp
 import aiofiles
 
@@ -14,6 +15,96 @@ from config import load_config, LOCAL_API_LIMIT, get_ffmpeg_command, check_ffmpe
 from PIL import Image
 
 logger = logging.getLogger(__name__)
+
+
+class UploadRetryableError(Exception):
+    """A temporary Telegram or transport failure that may be retried."""
+
+    def __init__(self, message, retry_after=None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+class UploadPermanentError(Exception):
+    """A Telegram API failure that should not be retried automatically."""
+
+
+RAW_UPLOAD_MAX_RETRIES = 5
+RETRYABLE_HTTP_STATUSES = {408, 425, 429, 500, 502, 503, 504}
+RETRYABLE_TRANSPORT_ERRORS = (
+    aiohttp.ClientConnectionError,
+    aiohttp.ClientPayloadError,
+    aiohttp.ServerTimeoutError,
+)
+
+
+def _retry_after_from_response(payload, headers):
+    """Extract Telegram's retry delay from a raw Bot API response."""
+    retry_after = None
+    if isinstance(payload, dict):
+        retry_after = payload.get('parameters', {}).get('retry_after')
+    if retry_after is None:
+        retry_after = headers.get('Retry-After')
+    try:
+        return max(0, float(retry_after)) if retry_after is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+async def _post_raw_telegram(endpoint, mpwriter, timeout):
+    """Send one raw Bot API request and classify its response for retrying."""
+    connector = aiohttp.TCPConnector(limit=1)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+            async with session.post(endpoint, data=mpwriter) as response:
+                body = await response.text()
+                try:
+                    result = json.loads(body)
+                except json.JSONDecodeError:
+                    result = {}
+
+                if response.status == 200 and result.get('ok'):
+                    return result.get('result')
+
+                description = result.get('description') or body or 'Unknown error'
+                retry_after = _retry_after_from_response(result, response.headers)
+                if response.status in RETRYABLE_HTTP_STATUSES or retry_after is not None:
+                    raise UploadRetryableError(
+                        f"Telegram API error: {description}", retry_after=retry_after
+                    )
+                raise UploadPermanentError(f"Telegram API error: {description}")
+    except RETRYABLE_TRANSPORT_ERRORS as exc:
+        raise UploadRetryableError(f"Telegram transport error: {exc}") from exc
+    except asyncio.TimeoutError as exc:
+        raise UploadRetryableError("Telegram upload timed out") from exc
+
+
+async def _retry_raw_upload(make_request, operation_name, max_retries=RAW_UPLOAD_MAX_RETRIES):
+    """Retry a raw upload while rebuilding its multipart stream on every attempt."""
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            return await make_request()
+        except UploadRetryableError as exc:
+            last_error = exc
+            if attempt == max_retries - 1:
+                break
+            delay = exc.retry_after
+            if delay is None:
+                delay = min(2 ** (attempt + 1), 60)
+            logger.warning(
+                "%s temporarily failed (%s); retrying in %ss (attempt %s/%s)",
+                operation_name,
+                exc,
+                delay,
+                attempt + 1,
+                max_retries,
+            )
+            await asyncio.sleep(delay)
+
+    if last_error:
+        raise last_error
+    raise RuntimeError(f"{operation_name} failed without an upload error")
 
 def crop_to_square(image_path):
     """Crop an image to a 1:1 square ratio centered for Telegram thumbnails."""
@@ -142,7 +233,7 @@ def split_video(file_path, max_size_bytes=None):
     return [file_path]
 
 # --- Streaming Upload Functions ---
-async def upload_video_streaming(bot_token, api_url, chat_id, file_path, caption="", reply_markup=None, reply_to_message_id=None, thumb_path=None):
+async def upload_video_streaming(bot_token, api_url, chat_id, file_path, caption="", reply_markup=None, reply_to_message_id=None, thumb_path=None, max_retries=RAW_UPLOAD_MAX_RETRIES):
     """Upload video using streaming to minimize RAM usage."""
     endpoint = f"{api_url}{bot_token}/sendVideo"
     
@@ -151,60 +242,53 @@ async def upload_video_streaming(bot_token, api_url, chat_id, file_path, caption
     
     logger.info(f"Chunked streaming upload: {file_name} ({file_size / 1024 / 1024:.2f} MB)")
     
-    with aiohttp.MultipartWriter('form-data') as mpwriter:
-        part = mpwriter.append(str(chat_id))
-        part.set_content_disposition('form-data', name='chat_id')
+    async def make_request():
+        # A multipart writer consumes its streams.  It must be made afresh for
+        # every retry, otherwise Telegram receives an empty body on attempt 2.
+        with aiohttp.MultipartWriter('form-data') as mpwriter:
+            part = mpwriter.append(str(chat_id))
+            part.set_content_disposition('form-data', name='chat_id')
 
-        part = mpwriter.append(caption)
-        part.set_content_disposition('form-data', name='caption')
+            part = mpwriter.append(caption)
+            part.set_content_disposition('form-data', name='caption')
 
-        part = mpwriter.append('true')
-        part.set_content_disposition('form-data', name='supports_streaming')
+            part = mpwriter.append('true')
+            part.set_content_disposition('form-data', name='supports_streaming')
 
-        if reply_markup:
-            part = mpwriter.append(json.dumps(reply_markup))
-            part.set_content_disposition('form-data', name='reply_markup')
+            if reply_markup:
+                part = mpwriter.append(json.dumps(reply_markup))
+                part.set_content_disposition('form-data', name='reply_markup')
 
-        if reply_to_message_id:
-            part = mpwriter.append(str(reply_to_message_id))
-            part.set_content_disposition('form-data', name='reply_to_message_id')
+            if reply_to_message_id:
+                part = mpwriter.append(str(reply_to_message_id))
+                part.set_content_disposition('form-data', name='reply_to_message_id')
 
-        thumb_fh = None
-        video_fh = None
-        try:
-            if thumb_path and os.path.exists(thumb_path):
-                thumb_path = crop_to_square(thumb_path)
-                thumb_fh = open(thumb_path, 'rb')
-                thumb_part = mpwriter.append(thumb_fh)
-                thumb_part.set_content_disposition('form-data', name='thumbnail', filename=os.path.basename(thumb_path))
-                thumb_part.headers['Content-Type'] = 'image/jpeg'
+            thumb_fh = None
+            video_fh = None
+            try:
+                if thumb_path and os.path.exists(thumb_path):
+                    cropped_thumb_path = crop_to_square(thumb_path)
+                    thumb_fh = open(cropped_thumb_path, 'rb')
+                    thumb_part = mpwriter.append(thumb_fh)
+                    thumb_part.set_content_disposition('form-data', name='thumbnail', filename=os.path.basename(cropped_thumb_path))
+                    thumb_part.headers['Content-Type'] = 'image/jpeg'
 
-            video_fh = open(file_path, 'rb')
-            file_part = mpwriter.append(video_fh)
-            file_part.set_content_disposition('form-data', name='video', filename=file_name)
-            file_part.headers['Content-Type'] = 'video/mp4'
+                video_fh = open(file_path, 'rb')
+                file_part = mpwriter.append(video_fh)
+                file_part.set_content_disposition('form-data', name='video', filename=file_name)
+                file_part.headers['Content-Type'] = 'video/mp4'
 
-            timeout = aiohttp.ClientTimeout(total=7200)
-            connector = aiohttp.TCPConnector(limit=1)
+                timeout = aiohttp.ClientTimeout(total=7200)
+                return await _post_raw_telegram(endpoint, mpwriter, timeout)
+            finally:
+                if video_fh:
+                    video_fh.close()
+                if thumb_fh:
+                    thumb_fh.close()
 
-            async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-                async with session.post(endpoint, data=mpwriter) as response:
-                    result = await response.json()
-                    if response.status == 200 and result.get('ok'):
-                        if thumb_path and os.path.exists(thumb_path):
-                            try: os.remove(thumb_path)
-                            except: pass
-                        return result.get('result')
-                    else:
-                        error_msg = result.get('description', 'Unknown error')
-                        raise Exception(f"Telegram API error: {error_msg}")
-        finally:
-            if video_fh:
-                video_fh.close()
-            if thumb_fh:
-                thumb_fh.close()
+    return await _retry_raw_upload(make_request, f"Video upload {file_name}", max_retries=max_retries)
 
-async def upload_audio_streaming(bot_token, api_url, chat_id, file_path, title="", caption="", reply_to_message_id=None, thumb_path=None):
+async def upload_audio_streaming(bot_token, api_url, chat_id, file_path, title="", caption="", reply_to_message_id=None, thumb_path=None, max_retries=RAW_UPLOAD_MAX_RETRIES):
     """Upload audio using streaming to minimize RAM usage."""
     endpoint = f"{api_url}{bot_token}/sendAudio"
     
@@ -213,49 +297,42 @@ async def upload_audio_streaming(bot_token, api_url, chat_id, file_path, title="
     
     logger.info(f"Streaming audio upload: {file_name} ({file_size / 1024 / 1024:.2f} MB)")
     
-    with aiohttp.MultipartWriter('form-data') as mpwriter:
-        part = mpwriter.append(str(chat_id))
-        part.set_content_disposition('form-data', name='chat_id')
-        
-        part = mpwriter.append(caption)
-        part.set_content_disposition('form-data', name='caption')
-        
-        part = mpwriter.append(title)
-        part.set_content_disposition('form-data', name='title')
-        
-        if reply_to_message_id:
-            part = mpwriter.append(str(reply_to_message_id))
-            part.set_content_disposition('form-data', name='reply_to_message_id')
+    async def make_request():
+        with aiohttp.MultipartWriter('form-data') as mpwriter:
+            part = mpwriter.append(str(chat_id))
+            part.set_content_disposition('form-data', name='chat_id')
 
-        thumb_fh = None
-        audio_fh = None
-        try:
-            if thumb_path and os.path.exists(thumb_path):
-                thumb_path = crop_to_square(thumb_path)
-                thumb_fh = open(thumb_path, 'rb')
-                thumb_part = mpwriter.append(thumb_fh)
-                thumb_part.set_content_disposition('form-data', name='thumbnail', filename=os.path.basename(thumb_path))
-                thumb_part.headers['Content-Type'] = 'image/jpeg'
+            part = mpwriter.append(caption)
+            part.set_content_disposition('form-data', name='caption')
 
-            audio_fh = open(file_path, 'rb')
-            file_part = mpwriter.append(audio_fh)
-            file_part.set_content_disposition('form-data', name='audio', filename=file_name)
-            file_part.headers['Content-Type'] = 'audio/mp4'
+            part = mpwriter.append(title)
+            part.set_content_disposition('form-data', name='title')
 
-            timeout = aiohttp.ClientTimeout(total=3600)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(endpoint, data=mpwriter) as response:
-                    result = await response.json()
-                    if response.status == 200 and result.get('ok'):
-                        if thumb_path and os.path.exists(thumb_path):
-                            try: os.remove(thumb_path)
-                            except: pass
-                        return result.get('result')
-                    else:
-                        error_msg = result.get('description', 'Unknown error')
-                        raise Exception(f"Telegram API error: {error_msg}")
-        finally:
-            if audio_fh:
-                audio_fh.close()
-            if thumb_fh:
-                thumb_fh.close()
+            if reply_to_message_id:
+                part = mpwriter.append(str(reply_to_message_id))
+                part.set_content_disposition('form-data', name='reply_to_message_id')
+
+            thumb_fh = None
+            audio_fh = None
+            try:
+                if thumb_path and os.path.exists(thumb_path):
+                    cropped_thumb_path = crop_to_square(thumb_path)
+                    thumb_fh = open(cropped_thumb_path, 'rb')
+                    thumb_part = mpwriter.append(thumb_fh)
+                    thumb_part.set_content_disposition('form-data', name='thumbnail', filename=os.path.basename(cropped_thumb_path))
+                    thumb_part.headers['Content-Type'] = 'image/jpeg'
+
+                audio_fh = open(file_path, 'rb')
+                file_part = mpwriter.append(audio_fh)
+                file_part.set_content_disposition('form-data', name='audio', filename=file_name)
+                file_part.headers['Content-Type'] = 'audio/mp4'
+
+                timeout = aiohttp.ClientTimeout(total=3600)
+                return await _post_raw_telegram(endpoint, mpwriter, timeout)
+            finally:
+                if audio_fh:
+                    audio_fh.close()
+                if thumb_fh:
+                    thumb_fh.close()
+
+    return await _retry_raw_upload(make_request, f"Audio upload {file_name}", max_retries=max_retries)
