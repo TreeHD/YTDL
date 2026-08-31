@@ -58,5 +58,13 @@ class TestConfig(unittest.TestCase):
             self.assertEqual(config['ytdlp_update_time'], '04:00')
             self.assertEqual(config['ytdlp_update_timezone'], 'Asia/Taipei')
 
+    def test_live_recovery_defaults(self):
+        with patch.dict(os.environ, {}, clear=True):
+            config = load_config()
+            self.assertEqual(config['live_proxy_recovery_window_seconds'], 1800)
+            self.assertEqual(config['live_proxy_retry_initial_seconds'], 3)
+            self.assertEqual(config['live_proxy_retry_max_seconds'], 60)
+            self.assertEqual(config['live_end_confirmations'], 2)
+
 if __name__ == '__main__':
     unittest.main()

@@ -44,6 +44,12 @@ def load_config():
         'ytdlp_daily_update': env_flag('YTDLP_DAILY_UPDATE', True),
         'ytdlp_update_time': os.getenv('YTDLP_UPDATE_TIME', '04:00'),
         'ytdlp_update_timezone': os.getenv('YTDLP_UPDATE_TIMEZONE', 'Asia/Taipei'),
+        'live_proxy_recovery_window_seconds': int(os.getenv('LIVE_PROXY_RECOVERY_WINDOW_SECONDS', '1800')),
+        'live_proxy_retry_initial_seconds': int(os.getenv('LIVE_PROXY_RETRY_INITIAL_SECONDS', '3')),
+        'live_proxy_retry_max_seconds': int(os.getenv('LIVE_PROXY_RETRY_MAX_SECONDS', '60')),
+        'live_warp_restart_cooldown_seconds': int(os.getenv('LIVE_WARP_RESTART_COOLDOWN_SECONDS', '60')),
+        'live_end_confirmations': int(os.getenv('LIVE_END_CONFIRMATIONS', '2')),
+        'live_end_confirmation_interval_seconds': int(os.getenv('LIVE_END_CONFIRMATION_INTERVAL_SECONDS', '15')),
     }
 
 def get_ffmpeg_command():

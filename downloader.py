@@ -6,6 +6,7 @@ Handles yt-dlp downloads with proxy rotation.
 import os
 import logging
 import yt_dlp
+from dataclasses import dataclass, field
 
 from config import DOWNLOAD_DIR, get_proxy_list, load_config, get_ffmpeg_command, get_cookie_file
 
@@ -14,6 +15,50 @@ logger = logging.getLogger(__name__)
 import urllib.request
 import urllib.error
 import time
+
+
+@dataclass
+class LiveProbeResult:
+    """A safe live-state result; transport failures are always UNKNOWN."""
+
+    state: str  # LIVE, ENDED, or UNKNOWN
+    info: dict = field(default_factory=dict)
+    errors: list = field(default_factory=list)
+
+
+def probe_live_state(url, expected_video_id=None):
+    """Probe a live URL through configured proxies without conflating errors.
+
+    This is synchronous because yt-dlp is synchronous. Async callers must run
+    it in an executor. A non-live result is only meaningful for the expected
+    video, never for a redirect to a different video.
+    """
+    errors = []
+    for proxy in get_proxy_list():
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'extract_flat': False,
+            'socket_timeout': 10,
+            'retries': 1,
+            'nocheckcertificate': True,
+        }
+        if proxy:
+            ydl_opts['proxy'] = proxy
+        _apply_cookie(ydl_opts)
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+            video_id = info.get('id', '')
+            if expected_video_id and video_id != expected_video_id:
+                errors.append('resolved to a different video id')
+                continue
+            if info.get('is_live'):
+                return LiveProbeResult('LIVE', info, errors)
+            return LiveProbeResult('ENDED', info, errors)
+        except Exception as exc:
+            errors.append(str(exc)[:300])
+    return LiveProbeResult('UNKNOWN', errors=errors)
 
 # Geo restrictions should move directly to the next proxy.  Rotating WARP for
 # these is wasteful: the current IP may be valid for other videos and another
@@ -423,7 +468,7 @@ def is_playlist(url):
     return False
 
 def get_live_info(channel_id):
-    """Check if a channel is currently live and get video info."""
+    """Check a channel's live endpoint without treating lookup errors as off-air."""
     proxy_list = get_proxy_list()
     live_url = f"https://www.youtube.com/channel/{channel_id}/live"
 
@@ -443,16 +488,18 @@ def get_live_info(channel_id):
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(live_url, download=False)
                 if info.get('is_live'):
-                    return {
+                    return LiveProbeResult('LIVE', {
                         'id': info.get('id', ''),
                         'title': info.get('title', 'Live Stream'),
                         'url': info.get('webpage_url', live_url),
                         'uploader': info.get('uploader', 'Unknown'),
                         'is_live': True
-                    }
-        except:
+                    })
+                return LiveProbeResult('ENDED', info)
+        except Exception as exc:
+            logger.warning("Live discovery failed via proxy=%s: %s", bool(proxy), exc)
             continue
-    return None
+    return LiveProbeResult('UNKNOWN')
 
 def get_stream_url(url):
     """Get the direct stream URL (HLS/Dash) and the proxy used."""

@@ -73,6 +73,8 @@ flowchart LR
 | 訂閱新影片 | 依 `SUBSCRIPTION_CHECK_INTERVAL`（預設 300 秒）檢查頻道，有新片就自動排入佇列。 |
 | 訂閱直播 | 開始時同時錄兩路：streamlink 從現在錄作為保險；yt-dlp 嘗試從直播開頭封存。從頭錄製穩定 10 分鐘後，會停掉 streamlink 並刪除它的重複暫存，最後只傳從頭錄的完整版。沒有 DVR/VOD 時，streamlink 會繼續錄。 |
 
+直播錄影遇到 Proxy／WARP 中斷時不會直接判定下播。Bot 會輪替所有設定的代理、以退避方式重試，並透過 YouTube metadata 連續兩次確認同一支影片已不在直播，才會上傳為 `(End)`。預設 30 分鐘內仍無法恢復時，會上傳已錄到的片段並標記 `(Proxy interrupted)`，保留狀態訊息說明直播結束尚未確認。
+
 直播流程如下：
 
 ```mermaid
@@ -269,6 +271,10 @@ https://www.youtube.com/watch?v=example
 | `YTDLP_DAILY_UPDATE` | 選填 | `true` | 每天自動更新 yt-dlp。 |
 | `YTDLP_UPDATE_TIME` | 選填 | `04:00` | 每日更新時間。 |
 | `YTDLP_UPDATE_TIMEZONE` | 選填 | `Asia/Taipei` | 每日更新的時區。 |
+| `LIVE_PROXY_RECOVERY_WINDOW_SECONDS` | 選填 | `1800` | 直播 Proxy 故障後的最大復原時間；到期會安全上傳已有片段。 |
+| `LIVE_PROXY_RETRY_INITIAL_SECONDS` / `LIVE_PROXY_RETRY_MAX_SECONDS` | 選填 | `3` / `60` | 直播重連指數退避的初始與最大等待秒數。 |
+| `LIVE_WARP_RESTART_COOLDOWN_SECONDS` | 選填 | `60` | WARP restart 的最短間隔，避免反覆重啟。 |
+| `LIVE_END_CONFIRMATIONS` / `LIVE_END_CONFIRMATION_INTERVAL_SECONDS` | 選填 | `2` / `15` | 判定直播真正結束所需的成功確認次數與間隔。 |
 
 ### Proxy 與 WARP
 

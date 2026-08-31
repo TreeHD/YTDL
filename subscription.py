@@ -150,7 +150,8 @@ class SubscriptionMonitor:
         try:
             loop = asyncio.get_running_loop()
             live_info = await loop.run_in_executor(None, lambda: get_live_info(channel_id))
-            if live_info:
+            if live_info.state == 'LIVE':
+                live_info = live_info.info
                 live_id = f"live_{live_info['id']}"
                 if not is_video_processed(live_id):
                     logger.info(f"New LIVE stream found: {live_info['title']} from {channel_name}")
@@ -179,12 +180,13 @@ class SubscriptionMonitor:
                                 sub['max_quality'],
                                 msg,
                                 channel_name,
-                                True # is_live
+                                True, # is_live
+                                live_info['id'],
                             ))
                         except Exception as e:
                             self.active_live_recordings.discard(rec_key)
                             logger.error(f"Failed to notify live for chat {sub['chat_id']}: {e}")
-            else:
+            elif live_info.state == 'ENDED':
                 # Channel no longer live — clear active recording locks for this channel
                 video_ids_for_channel = [vid for vid, cid in self._live_channel_map.items() if cid == channel_id]
                 to_remove = set()
@@ -195,6 +197,8 @@ class SubscriptionMonitor:
                     del self._live_channel_map[vid]
                 if to_remove:
                     self.active_live_recordings -= to_remove
+            else:
+                logger.warning("Live state for %s is unknown; keeping recording locks", channel_id)
         except Exception as e:
             logger.error(f"Error checking live for {channel_id}: {e}")
 
