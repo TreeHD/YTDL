@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 import urllib.request
 import urllib.error
 import time
+from urllib.parse import urlparse
 
 
 @dataclass
@@ -24,6 +25,32 @@ class LiveProbeResult:
     state: str  # LIVE, ENDED, or UNKNOWN
     info: dict = field(default_factory=dict)
     errors: list = field(default_factory=list)
+
+
+TWITCH_CHANNEL_PREFIX = 'twitch:'
+
+
+def _twitch_channel_slug(channel_url):
+    """Return the Twitch channel name for a channel URL, if it is one.
+
+    Twitch's extractor treats an offline channel URL as a failed *stream*
+    lookup. Parse its stable channel slug locally before invoking yt-dlp so an
+    offline channel can still be subscribed to.
+    """
+    parsed = urlparse(channel_url)
+    host = (parsed.hostname or '').lower()
+    if host != 'twitch.tv' and not host.endswith('.twitch.tv'):
+        return None
+
+    parts = [part for part in parsed.path.split('/') if part]
+    if not parts:
+        return None
+    return parts[0].lower()
+
+
+def is_twitch_channel_id(channel_id):
+    """Whether a persisted subscription ID belongs to Twitch."""
+    return channel_id.startswith(TWITCH_CHANNEL_PREFIX)
 
 
 def probe_live_state(url, expected_video_id=None):
@@ -192,6 +219,16 @@ def get_video_info(url):
 
 def get_channel_info(channel_url):
     """Get channel information including ID and name."""
+    twitch_channel = _twitch_channel_slug(channel_url)
+    if twitch_channel:
+        # Do not ask the Twitch stream extractor for channel metadata here:
+        # it intentionally fails while the broadcaster is offline.
+        return {
+            'channel_id': f'{TWITCH_CHANNEL_PREFIX}{twitch_channel}',
+            'channel_name': twitch_channel,
+            'url': f'https://www.twitch.tv/{twitch_channel}',
+        }
+
     proxy_list = get_proxy_list()
     
     for proxy in proxy_list:
@@ -226,6 +263,11 @@ def get_channel_info(channel_url):
 
 def get_latest_videos(channel_id, limit=5):
     """Get latest videos from a channel. Merges results across proxies to catch geo-restricted ones."""
+    # Twitch subscriptions are live-only. They must never be queried through
+    # YouTube's /channel/<id>/videos endpoint.
+    if is_twitch_channel_id(channel_id):
+        return []
+
     proxy_list = get_proxy_list()
     channel_url = f"https://www.youtube.com/channel/{channel_id}/videos"
     all_videos = {}
@@ -470,7 +512,11 @@ def is_playlist(url):
 def get_live_info(channel_id):
     """Check a channel's live endpoint without treating lookup errors as off-air."""
     proxy_list = get_proxy_list()
-    live_url = f"https://www.youtube.com/channel/{channel_id}/live"
+    is_twitch = is_twitch_channel_id(channel_id)
+    live_url = (
+        f"https://www.twitch.tv/{channel_id[len(TWITCH_CHANNEL_PREFIX):]}"
+        if is_twitch else f"https://www.youtube.com/channel/{channel_id}/live"
+    )
 
     for proxy in proxy_list:
         ydl_opts = {
@@ -497,6 +543,11 @@ def get_live_info(channel_id):
                     })
                 return LiveProbeResult('ENDED', info)
         except Exception as exc:
+            # Unlike YouTube's /live redirect, an offline Twitch channel is
+            # reported by yt-dlp as an extractor error. This is an expected
+            # state, not a failed monitor check.
+            if is_twitch and 'not currently live' in str(exc).lower():
+                return LiveProbeResult('ENDED')
             logger.warning("Live discovery failed via proxy=%s: %s", bool(proxy), exc)
             continue
     return LiveProbeResult('UNKNOWN')

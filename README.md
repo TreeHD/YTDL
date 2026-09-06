@@ -239,12 +239,14 @@ https://www.youtube.com/watch?v=example
 | `/mp3 <網址>` | `/mp3 https://…` | 下載 MP3 音訊。 |
 | `/playlist <網址> [畫質]` | `/playlist https://… 720` | 逐部下載播放清單。 |
 | `/settings` | `/settings` | 按按鈕設定直接貼網址時的預設格式與畫質。 |
-| `/subscribe <頻道網址> [畫質]` | `/subscribe https://youtube.com/@example 1080` | 訂閱新影片。 |
+| `/subscribe <頻道網址> [畫質]` | `/subscribe https://youtube.com/@example 1080` | 訂閱新影片；Twitch 頻道會自動改為訂閱開台。 |
 | `/sublive <頻道網址> [畫質]` | `/sublive https://youtube.com/@example 720` | 訂閱直播並自動錄製。 |
 | `/unsubscribe <頻道網址>` | `/unsubscribe https://youtube.com/@example` | 取消新影片訂閱。 |
 | `/unsublive <頻道網址>` | `/unsublive https://youtube.com/@example` | 取消直播訂閱。 |
 | `/subscriptions` | `/subscriptions` | 列出目前所有訂閱。 |
 | `/upgrade` | `/upgrade` | 手動更新 yt-dlp nightly；有下載任務時會拒絕執行。 |
+
+Twitch 頻道離線時也可以直接用 `/subscribe https://www.twitch.tv/<channel>` 建立訂閱；Bot 依 `SUBSCRIPTION_CHECK_INTERVAL` 輪詢，偵測到開台後才開始錄製與上傳。
 
 直播進度訊息會有兩個按鈕：
 

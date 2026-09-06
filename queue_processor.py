@@ -7,6 +7,7 @@ import logging
 import glob
 import itertools
 import secrets
+import signal
 from dataclasses import dataclass, field
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -625,7 +626,6 @@ async def process_queue(application, request_queue):
 
 async def _kill_process(process, task_id):
     """Gracefully stop process: SIGINT → SIGTERM → SIGKILL."""
-    import signal
     try:
         process.send_signal(signal.SIGINT)
         await asyncio.wait_for(process.wait(), timeout=20)
@@ -658,6 +658,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
     logger.info(f"[LIVE:{task_id}] START url={url}, chat_id={chat_id}, channel={channel_name}")
     fromstart_upload_tasks = []
     fromstart_stable = asyncio.Event()
+    fromstart_recording_done = asyncio.Event()
 
     def _make_keyboard():
         return InlineKeyboardMarkup([[
@@ -745,6 +746,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                 continue
 
         if proc is None:
+            fromstart_recording_done.set()
             logger.error(f"[LIVE:{bg_id}] All proxies failed to spawn")
             await live_status(
                 "⚠️ From-start archive could not be started.\n"
@@ -799,6 +801,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                             f"{LIVE_FROM_START_MAX_DATA_GAP_SECONDS}s; resetting stability timer"
                         )
                         first_data_time = None
+                        fromstart_stable.clear()
                     continue
 
                 if not chunk:
@@ -844,6 +847,10 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
         except Exception as e:
             logger.error(f"[LIVE:{bg_id}] Pipe read error: {e}", exc_info=True)
         finally:
+            # Recording health must not depend on pending remux/upload jobs.
+            # An upload can wait for minutes after the archive has reached EOF.
+            fromstart_stable.clear()
+            fromstart_recording_done.set()
             # Close last segment and upload if it has data
             if seg_file:
                 seg_file.close()
@@ -1034,7 +1041,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
 
     async def _start_recording(part_path, proxy_list):
         """Start a streamlink recording process, trying each proxy.
-        Waits a few seconds to verify the process doesn't die immediately.
+        Requires media data before handing off from a working recorder.
         Returns (process, proxy) or (None, None)."""
         for proxy in proxy_list:
             cmd = _build_record_cmd(part_path, proxy)
@@ -1050,8 +1057,10 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                 logger.error(f"[LIVE:{task_id}] Spawn failed proxy={proxy}: {e}")
                 continue
 
-            # Wait up to 5s to verify process doesn't die immediately
-            for _ in range(5):
+            # A running process can still be waiting for a playlist or proxy.
+            # Never retire a working recorder until the replacement has data.
+            file_size = 0
+            for _ in range(30):
                 await asyncio.sleep(1)
                 if proc.returncode is not None:
                     break
@@ -1070,6 +1079,14 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                 if os.path.exists(part_path) and os.path.getsize(part_path) == 0:
                     try: os.remove(part_path)
                     except: pass
+                continue
+
+            if file_size == 0:
+                logger.warning(f"[LIVE:{task_id}] streamlink produced no data with proxy={proxy}; trying next proxy")
+                asyncio.create_task(_drain_stderr(proc, proxy))
+                await _kill_process(proc, task_id)
+                try: os.remove(part_path)
+                except: pass
                 continue
 
             # Process survived — drain stderr pipe in background to prevent deadlock
@@ -1248,7 +1265,8 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                 termination_reason = 'stopped'
                 break
 
-            if fromstart_stable.is_set() and not live_edge_retired:
+            if (fromstart_stable.is_set() and not fromstart_recording_done.is_set()
+                    and not fromstart_task.done() and not live_edge_retired):
                 logger.info(
                     f"[LIVE:{task_id}] From-start archive is stable; "
                     "stopping and discarding the duplicate live-edge backup"
@@ -1272,9 +1290,11 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
             # primary. Fall back to the live edge and make a fresh, verified
             # connection instead of treating that worker's EOF as stream end.
             if live_edge_retired:
-                if not fromstart_task.done():
+                if (fromstart_stable.is_set() and not fromstart_recording_done.is_set()
+                        and not fromstart_task.done()):
                     await asyncio.sleep(3)
                     continue
+                logger.warning(f"[LIVE:{task_id}] Archive stopped or stalled; restoring live-edge recording without waiting for uploads")
                 fromstart_stable.clear()
                 live_edge_retired = False
                 part_num += 1

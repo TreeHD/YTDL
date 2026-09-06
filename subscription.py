@@ -15,6 +15,7 @@ from database import (
 )
 from downloader import get_latest_videos, get_live_info
 from config import load_config
+from telegram_utils import tg_retry
 
 logger = logging.getLogger(__name__)
 
@@ -125,7 +126,7 @@ class SubscriptionMonitor:
                 
                 for sub in subscribers:
                     try:
-                        status_msg = await self.application.bot.send_message(
+                        status_msg = await tg_retry(self.application.bot.send_message,
                             chat_id=sub['chat_id'],
                             text=f"🔔 **New Video from {channel_name}**\n\n"
                                  f"📹 {video['title']}\n\n"
@@ -166,7 +167,7 @@ class SubscriptionMonitor:
                         self.active_live_recordings.add(rec_key)
                         self._live_channel_map[live_info['id']] = channel_id
                         try:
-                            msg = await self.application.bot.send_message(
+                            msg = await tg_retry(self.application.bot.send_message,
                                 chat_id=sub['chat_id'],
                                 text=f"🔴 **LIVE: {channel_name} is streaming now!**\n\n"
                                      f"📹 {live_info['title']}\n\n"

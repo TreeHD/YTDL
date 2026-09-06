@@ -19,7 +19,7 @@ from database import (
 )
 from downloader import (
     download_content, get_video_info, 
-    get_channel_info, get_playlist_info, is_playlist
+    get_channel_info, get_playlist_info, is_playlist, is_twitch_channel_id
 )
 from uploader import upload_video_streaming, upload_audio_streaming, split_video, crop_to_square
 from telegram_utils import tg_retry
@@ -336,34 +336,47 @@ async def _perform_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE,
         except ValueError:
             pass
     
-    status_msg = await context.bot.send_message(chat_id=chat_id, text="🔍 Getting channel info...", reply_to_message_id=message_id)
+    status_msg = await tg_retry(
+        context.bot.send_message,
+        chat_id=chat_id,
+        text="🔍 Getting channel info...",
+        reply_to_message_id=message_id,
+    )
     
     try:
         loop = asyncio.get_running_loop()
         channel_info = await loop.run_in_executor(None, lambda: get_channel_info(channel_url))
         
+        # Twitch channels do not expose an upload feed that this bot monitors.
+        # Treat any Twitch subscription as a live-stream subscription, even
+        # when the legacy /subscribe alias was used.
+        effective_sub_type = 'live' if is_twitch_channel_id(channel_info['channel_id']) else sub_type
         success = add_subscription(
             channel_id=channel_info['channel_id'],
             channel_name=channel_info['channel_name'],
             chat_id=chat_id,
             max_quality=max_quality,
-            sub_type=sub_type
+            sub_type=effective_sub_type
         )
         
         if success:
-            type_str = "Videos" if sub_type == 'video' else "Live Streams"
-            await status_msg.edit_text(
+            type_str = "Videos" if effective_sub_type == 'video' else "Live Streams"
+            platform_note = (
+                "\n\nTwitch is checked for live streams automatically."
+                if is_twitch_channel_id(channel_info['channel_id']) else ""
+            )
+            await tg_retry(status_msg.edit_text,
                 f"✅ **Subscribed ({type_str})!**\n\n"
                 f"📺 Channel: {channel_info['channel_name']}\n"
                 f"🎬 Quality: {max_quality}p\n\n"
-                f"You'll receive {type_str.lower()} automatically!",
+                f"You'll receive {type_str.lower()} automatically!{platform_note}",
                 parse_mode='Markdown'
             )
         else:
-            await status_msg.edit_text("❌ Failed to save subscription.")
+            await tg_retry(status_msg.edit_text, "❌ Failed to save subscription.")
             
     except Exception as e:
-        await status_msg.edit_text(f"❌ Error: {e}")
+        await tg_retry(status_msg.edit_text, f"❌ Error: {e}")
 
 async def handle_unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /unsubscribe command."""
@@ -390,10 +403,11 @@ async def handle_unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE)
     try:
         loop = asyncio.get_running_loop()
         channel_info = await loop.run_in_executor(None, lambda: get_channel_info(channel_url))
-        success = remove_subscription(channel_info['channel_id'], chat_id, sub_type=sub_type)
+        effective_sub_type = 'live' if is_twitch_channel_id(channel_info['channel_id']) else sub_type
+        success = remove_subscription(channel_info['channel_id'], chat_id, sub_type=effective_sub_type)
         
         if success:
-            type_str = "Live Streams" if sub_type == 'live' else "Videos"
+            type_str = "Live Streams" if effective_sub_type == 'live' else "Videos"
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=f"✅ Unsubscribed from {type_str} for: {channel_info['channel_name']}",
