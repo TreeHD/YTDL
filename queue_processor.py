@@ -5,6 +5,7 @@ import asyncio
 import time
 import logging
 import glob
+import csv
 import itertools
 import secrets
 import signal
@@ -15,7 +16,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from config import load_config, check_disk_space, check_ffmpeg, DOWNLOAD_DIR, get_ffmpeg_command, get_proxy_list, get_cookie_file
 from downloader import (
     download_content, get_video_info, get_playlist_info,
-    probe_live_state, restart_warp_proxy,
+    probe_live_state, restart_warp_proxy, is_twitch_url,
 )
 from uploader import (
     upload_video_streaming,
@@ -39,6 +40,7 @@ active_live_tasks = set()
 # both recorders would only create duplicate uploads.
 LIVE_FROM_START_STABILITY_SECONDS = 10 * 60
 LIVE_FROM_START_MAX_DATA_GAP_SECONDS = 30
+LIVE_ARCHIVE_CHUNK_SECONDS = 60
 
 # Upload retries are deliberately separate from the download queue.  A Telegram
 # flood-control delay must never keep every later download waiting behind it.
@@ -85,6 +87,55 @@ def _safe_remove(path):
             os.remove(path)
     except Exception as exc:
         logger.warning("Failed to remove temporary upload file %s: %s", path, exc)
+
+
+def _build_archive_segment_command(ffmpeg, segment_pattern, segment_list_path):
+    """Remux yt-dlp's stdout into closed, independently seekable TS chunks."""
+    return [
+        ffmpeg, '-y', '-hide_banner', '-loglevel', 'warning',
+        '-fflags', '+genpts', '-i', 'pipe:0',
+        '-map', '0:v?', '-map', '0:a?', '-c', 'copy',
+        '-f', 'segment',
+        '-segment_format', 'mpegts',
+        '-segment_time', str(LIVE_ARCHIVE_CHUNK_SECONDS),
+        '-reset_timestamps', '1',
+        '-segment_list', segment_list_path,
+        '-segment_list_type', 'csv',
+        '-segment_start_number', '1',
+        segment_pattern,
+    ]
+
+
+def _read_completed_archive_chunks(segment_list_path, download_dir):
+    """Return only segment-list entries ffmpeg has finished and closed."""
+    completed = []
+    try:
+        with open(segment_list_path, newline='', encoding='utf-8') as segment_list:
+            for row in csv.reader(segment_list):
+                if len(row) < 3 or not row[0]:
+                    continue
+                path = os.path.join(download_dir, os.path.basename(row[0]))
+                try:
+                    if os.path.getsize(path) > 1024:
+                        completed.append(path)
+                except OSError:
+                    continue
+    except FileNotFoundError:
+        pass
+    return completed
+
+
+async def _drain_process_stderr(stream, tail, max_bytes=32768):
+    """Drain a subprocess stderr pipe while keeping a bounded diagnostic tail."""
+    if stream is None:
+        return
+    while True:
+        chunk = await stream.read(4096)
+        if not chunk:
+            return
+        tail.extend(chunk)
+        if len(tail) > max_bytes:
+            del tail[:-max_bytes]
 
 
 async def _update_upload_job_status(job, text, show_retry=False):
@@ -656,20 +707,36 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
     """
     SEGMENT_SIZE_BYTES = 1900 * 1024 * 1024  # 1.9GB per segment
     logger.info(f"[LIVE:{task_id}] START url={url}, chat_id={chat_id}, channel={channel_name}")
-    fromstart_upload_tasks = []
     fromstart_stable = asyncio.Event()
     fromstart_recording_done = asyncio.Event()
+    fromstart_has_segment = asyncio.Event()
+    fromstart_failed = asyncio.Event()
+    pending_live_upload_retries = set()
+    live_failed_paths = set()
 
-    def _make_keyboard():
-        return InlineKeyboardMarkup([[
+    def _make_keyboard(retry_job_id=None):
+        rows = [[
             InlineKeyboardButton("⏹ Stop & Upload", callback_data=f"stoplive:{task_id}"),
             InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{task_id}"),
-        ]])
+        ]]
+        if retry_job_id:
+            rows.append([InlineKeyboardButton(
+                "🔁 Retry upload now", callback_data=f"retryupload:{retry_job_id}"
+            )])
+        return InlineKeyboardMarkup(rows)
 
-    async def live_status(text):
+    async def live_status(text, retry_job_id=None):
         nonlocal status_msg
         try:
-            keyboard = _make_keyboard()
+            if retry_job_id:
+                pending_live_upload_retries.add(retry_job_id)
+            if pending_live_upload_retries and retry_job_id is None:
+                retry_job_id = next(iter(pending_live_upload_retries))
+            if text.startswith("🔴 Recording") and pending_live_upload_retries:
+                text += "\n⏳ A previous segment is queued for upload retry."
+            if text.startswith("🔴 Recording") and fromstart_failed.is_set():
+                text += "\n⚠️ From-start archive failed; continuing with live-edge recording."
+            keyboard = _make_keyboard(retry_job_id)
             logger.info(f"[LIVE:{task_id}] live_status: '{text}'")
             if status_msg:
                 if status_msg.text != text:
@@ -719,234 +786,358 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
         cmd.append(url)
         return cmd
 
+    # FFmpeg closes each inner TS segment at a stream boundary; the consumer
+    # batches those files to preserve the existing ~1.9GiB upload cadence.
     async def _download_from_start():
-        """Archive from the beginning without interrupting the live-edge recorder.
-
-        A missing YouTube DVR/VOD is expected for some streams.  In that case
-        this worker exits quietly and leaves the streamlink recording untouched.
-        """
         bg_id = f"{task_id}_fromstart"
-        logger.info(f"[LIVE:{bg_id}] Auto from-start archive starting (pipe mode)")
-        proxy_list = get_proxy_list()
+        segment_list_path = os.path.join(DOWNLOAD_DIR, f"live_{bg_id}_segments.csv")
+        segment_pattern = os.path.join(DOWNLOAD_DIR, f"live_{bg_id}_chunk_%06d.ts")
+        segment_queue = asyncio.Queue(maxsize=3)
+        failed_paths = set()
+        consumer_cancelled = False
+        source_proc = None
+        segment_proc = None
+        source_stderr = bytearray()
+        segment_stderr = bytearray()
+        stderr_tasks = []
+        consumer_task = None
+        got_data = False
+        cancelled = False
+        total_bytes = 0
+        started_at = time.monotonic()
+        first_data_time = None
+        last_data_time = None
+        enqueued_paths = set()
 
-        proc = None
-        for proxy in proxy_list:
-            cmd = _build_fromstart_cmd(proxy)
-            logger.info(f"[LIVE:{bg_id}] cmd: {' '.join(cmd[:8])}...")
+        async def _remux_and_upload_batch(chunk_paths, batch_num, is_final=False):
+            concat_path = os.path.join(DOWNLOAD_DIR, f"live_{bg_id}_batch_{batch_num:04d}.ffconcat")
+            mp4_path = os.path.join(DOWNLOAD_DIR, f"live_{bg_id}_batch_{batch_num:04d}.mp4")
             try:
-                proc = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.DEVNULL,
-                )
-                logger.info(f"[LIVE:{bg_id}] pid={proc.pid}")
-                break
-            except Exception as e:
-                logger.error(f"[LIVE:{bg_id}] Spawn failed: {e}", exc_info=True)
-                continue
+                present = [path for path in chunk_paths if os.path.exists(path) and os.path.getsize(path) > 1024]
+                if not present:
+                    return False
+                with open(concat_path, 'w', encoding='utf-8') as concat_file:
+                    concat_file.write("ffconcat version 1.0\n")
+                    for path in present:
+                        # Generated names contain no quote or newline characters.
+                        concat_file.write(f"file '{os.path.abspath(path)}'\n")
 
-        if proc is None:
+                remux = await asyncio.create_subprocess_exec(
+                    get_ffmpeg_command(), '-y', '-hide_banner', '-loglevel', 'warning',
+                    '-fflags', '+genpts+discardcorrupt',
+                    '-f', 'concat', '-safe', '0', '-i', concat_path,
+                    '-map', '0', '-c', 'copy', '-movflags', '+faststart', mp4_path,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                remux_stderr = bytearray()
+                remux_stderr_task = asyncio.create_task(
+                    _drain_process_stderr(remux.stderr, remux_stderr)
+                )
+                try:
+                    await asyncio.wait_for(remux.wait(), timeout=30 * 60)
+                except asyncio.TimeoutError:
+                    logger.error("[LIVE:%s] Remux batch %s timed out", bg_id, batch_num)
+                    remux.kill()
+                    await remux.wait()
+                await remux_stderr_task
+
+                output_size = os.path.getsize(mp4_path) if os.path.exists(mp4_path) else 0
+                if remux.returncode != 0 or output_size <= 1024:
+                    details = remux_stderr.decode(errors='replace').strip()[-1200:]
+                    reason = details or f"ffmpeg exited with code {remux.returncode}"
+                    failed_paths.update(present)
+                    fromstart_failed.set()
+                    fromstart_stable.clear()
+                    logger.error("[LIVE:%s] Archive batch %s could not be packaged: %s", bg_id, batch_num, reason)
+                    await live_status(
+                        f"❌ From-start segment {batch_num} could not be packaged.\n"
+                        f"Source chunks are retained in downloads/.\n{reason}"
+                    )
+                    _safe_remove(mp4_path)
+                    return False
+
+                for path in present:
+                    _safe_remove(path)
+                _safe_remove(concat_path)
+
+                title = f"⏪ {channel_name} - From Start Part {batch_num}"
+                if is_final:
+                    title += " (Archive final segment)"
+
+                retry_job_ids = set()
+
+                async def _batch_upload_status(text, force=False, retry_job_id=None):
+                    if retry_job_id:
+                        retry_job_ids.add(retry_job_id)
+                        pending_live_upload_retries.add(retry_job_id)
+                    elif text.startswith("✅ Upload complete"):
+                        pending_live_upload_retries.difference_update(retry_job_ids)
+                    current_retry_id = retry_job_id
+                    if current_retry_id is None and retry_job_ids and any(
+                        retry_id in pending_live_upload_retries for retry_id in retry_job_ids
+                    ):
+                        current_retry_id = next(iter(retry_job_ids))
+                    await live_status(text, retry_job_id=current_retry_id)
+
+                logger.info(
+                    "[LIVE:%s] Uploading archive batch %s: %.1fMB",
+                    bg_id, batch_num, output_size / (1024 * 1024),
+                )
+                completed = await handle_upload(
+                    application, chat_id, mp4_path, title, url, False,
+                    _batch_upload_status, channel_name, message_id,
+                    allow_audio_download=False,
+                )
+                if completed:
+                    pending_live_upload_retries.difference_update(retry_job_ids)
+                else:
+                    if os.path.exists(mp4_path):
+                        failed_paths.add(mp4_path)
+                    for retry_id in retry_job_ids:
+                        job = _upload_retry_jobs.get(retry_id)
+                        if job:
+                            failed_paths.update(job.files_to_upload)
+                            failed_paths.add(job.source_file_path)
+                logger.info("[LIVE:%s] Archive batch %s upload returned completed=%s", bg_id, batch_num, completed)
+                return completed
+            except Exception as exc:
+                failed_paths.update(path for path in chunk_paths if os.path.exists(path))
+                fromstart_failed.set()
+                fromstart_stable.clear()
+                logger.error("[LIVE:%s] Remux/upload batch %s failed: %s", bg_id, batch_num, exc, exc_info=True)
+                await live_status(
+                    f"❌ From-start segment {batch_num} failed: {exc}\n"
+                    "Source chunks are retained in downloads/."
+                )
+                return False
+            finally:
+                _safe_remove(concat_path)
+
+        async def _consume_archive_chunks():
+            batch_paths = []
+            batch_bytes = 0
+            batch_num = 0
+            while True:
+                chunk_path = await segment_queue.get()
+                if chunk_path is None:
+                    break
+                try:
+                    chunk_size = os.path.getsize(chunk_path)
+                except OSError:
+                    continue
+                if chunk_size <= 1024:
+                    _safe_remove(chunk_path)
+                    continue
+                fromstart_has_segment.set()
+                if fromstart_failed.is_set():
+                    failed_paths.add(chunk_path)
+                    continue
+                if (
+                    first_data_time is not None
+                    and not fromstart_failed.is_set()
+                    and time.monotonic() - first_data_time >= LIVE_FROM_START_STABILITY_SECONDS
+                ):
+                    fromstart_stable.set()
+
+                if batch_paths and batch_bytes + chunk_size > SEGMENT_SIZE_BYTES:
+                    batch_num += 1
+                    await _remux_and_upload_batch(batch_paths, batch_num)
+                    batch_paths = []
+                    batch_bytes = 0
+                batch_paths.append(chunk_path)
+                batch_bytes += chunk_size
+
+            if batch_paths and not consumer_cancelled:
+                batch_num += 1
+                await _remux_and_upload_batch(batch_paths, batch_num, is_final=True)
+
+        async def _enqueue_closed_segments():
+            for chunk_path in _read_completed_archive_chunks(segment_list_path, DOWNLOAD_DIR):
+                if chunk_path in enqueued_paths:
+                    continue
+                enqueued_paths.add(chunk_path)
+                await segment_queue.put(chunk_path)
+
+        logger.info("[LIVE:%s] Starting ffmpeg segmented archive pipeline", bg_id)
+        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+        consumer_task = asyncio.create_task(_consume_archive_chunks())
+
+        for proxy in get_proxy_list():
+            try:
+                source_proc = await asyncio.create_subprocess_exec(
+                    *_build_fromstart_cmd(proxy),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                logger.info("[LIVE:%s] yt-dlp pid=%s", bg_id, source_proc.pid)
+                break
+            except Exception as exc:
+                logger.warning("[LIVE:%s] Could not start archive source via proxy: %s", bg_id, exc)
+
+        if source_proc is None:
             fromstart_recording_done.set()
-            logger.error(f"[LIVE:{bg_id}] All proxies failed to spawn")
+            consumer_cancelled = True
+            await segment_queue.put(None)
+            await consumer_task
             await live_status(
                 "⚠️ From-start archive could not be started.\n"
                 "🔴 Continuing to record from the current live position."
             )
             return False
 
-        seg_num = 0
-        seg_file = None
-        seg_path = None
-        seg_bytes = 0
-        total_bytes = 0
-        start_time = time.time()
-        first_data_time = None
-        last_data_time = None
-        got_data = False
-        cancelled = False
-
+        stderr_tasks.append(asyncio.create_task(
+            _drain_process_stderr(source_proc.stderr, source_stderr)
+        ))
         try:
+            segment_proc = await asyncio.create_subprocess_exec(
+                *_build_archive_segment_command(
+                    get_ffmpeg_command(), segment_pattern, segment_list_path
+                ),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            logger.info("[LIVE:%s] ffmpeg segmenter pid=%s", bg_id, segment_proc.pid)
+            stderr_tasks.append(asyncio.create_task(
+                _drain_process_stderr(segment_proc.stderr, segment_stderr)
+            ))
+
             while True:
-                # Check signals
+                if fromstart_failed.is_set():
+                    logger.error("[LIVE:%s] Stopping archive source after a segment packaging failure", bg_id)
+                    await _kill_process(source_proc, bg_id)
+                    break
                 if task_id in cancelled_tasks:
                     cancelled = True
-                    await _kill_process(proc, bg_id)
-                    logger.info(f"[LIVE:{bg_id}] Cancelled")
-                    return False
+                    await _kill_process(source_proc, bg_id)
+                    break
                 if task_id in stopped_tasks:
-                    logger.info(f"[LIVE:{bg_id}] Stop signal received")
-                    await _kill_process(proc, bg_id)
+                    await _kill_process(source_proc, bg_id)
                     break
 
-                # Read chunk from pipe (non-blocking with timeout)
                 try:
-                    chunk = await asyncio.wait_for(proc.stdout.read(1024 * 1024), timeout=5)
+                    chunk = await asyncio.wait_for(source_proc.stdout.read(1024 * 1024), timeout=3)
                 except asyncio.TimeoutError:
-                    # No data yet — check if process died
-                    if proc.returncode is not None:
+                    await _enqueue_closed_segments()
+                    if source_proc.returncode is not None:
                         break
-                    # VOD unavailable check
-                    elapsed = time.time() - start_time
+                    elapsed = time.monotonic() - started_at
                     if elapsed > 90 and not got_data:
-                        logger.warning(f"[LIVE:{bg_id}] No data after {elapsed:.0f}s, VOD likely unavailable")
-                        await _kill_process(proc, bg_id)
-                        return False
+                        logger.warning("[LIVE:%s] Archive produced no data for 90s", bg_id)
+                        await _kill_process(source_proc, bg_id)
+                        break
                     if (
-                        first_data_time is not None
-                        and last_data_time is not None
+                        first_data_time is not None and last_data_time is not None
                         and time.monotonic() - last_data_time > LIVE_FROM_START_MAX_DATA_GAP_SECONDS
                     ):
-                        logger.warning(
-                            f"[LIVE:{bg_id}] No archive data for over "
-                            f"{LIVE_FROM_START_MAX_DATA_GAP_SECONDS}s; resetting stability timer"
-                        )
+                        logger.warning("[LIVE:%s] Archive data gap reset the stability timer", bg_id)
                         first_data_time = None
                         fromstart_stable.clear()
                     continue
 
                 if not chunk:
-                    # EOF — yt-dlp finished
                     break
-
                 got_data = True
-                data_time = time.monotonic()
+                total_bytes += len(chunk)
+                now = time.monotonic()
                 if first_data_time is None:
-                    first_data_time = data_time
+                    first_data_time = now
                 elif (
-                    not fromstart_stable.is_set()
-                    and data_time - first_data_time >= LIVE_FROM_START_STABILITY_SECONDS
+                    fromstart_has_segment.is_set()
+                    and not fromstart_failed.is_set()
+                    and not fromstart_stable.is_set()
+                    and now - first_data_time >= LIVE_FROM_START_STABILITY_SECONDS
                 ):
                     fromstart_stable.set()
-                    logger.info(
-                        f"[LIVE:{bg_id}] From-start archive stable for "
-                        f"{LIVE_FROM_START_STABILITY_SECONDS}s; retiring live-edge backup"
-                    )
-                last_data_time = data_time
-                total_bytes += len(chunk)
+                    logger.info("[LIVE:%s] Archive healthy for %ss", bg_id, LIVE_FROM_START_STABILITY_SECONDS)
+                last_data_time = now
 
-                # Open new segment file if needed
-                if seg_file is None:
-                    seg_num += 1
-                    seg_path = os.path.join(DOWNLOAD_DIR, f"live_{bg_id}_seg{seg_num:03d}.ts")
-                    seg_file = open(seg_path, 'wb')
-                    seg_bytes = 0
-
-                seg_file.write(chunk)
-                seg_bytes += len(chunk)
-
-                # Segment full — close, remux+upload, start next
-                if seg_bytes >= SEGMENT_SIZE_BYTES:
-                    seg_file.close()
-                    seg_file = None
-                    seg_mp4 = os.path.join(DOWNLOAD_DIR, f"live_{bg_id}_seg{seg_num:03d}.mp4")
-                    logger.info(f"[LIVE:{bg_id}] Segment {seg_num} complete: {seg_bytes/(1024*1024):.1f}MB (total: {total_bytes/(1024*1024):.0f}MB)")
-                    fromstart_upload_tasks.append(
-                        asyncio.create_task(_remux_and_upload_bg(bg_id, seg_path, seg_mp4, seg_num))
-                    )
-
-        except Exception as e:
-            logger.error(f"[LIVE:{bg_id}] Pipe read error: {e}", exc_info=True)
-        finally:
-            # Recording health must not depend on pending remux/upload jobs.
-            # An upload can wait for minutes after the archive has reached EOF.
-            fromstart_stable.clear()
-            fromstart_recording_done.set()
-            # Close last segment and upload if it has data
-            if seg_file:
-                seg_file.close()
-                if not cancelled and seg_bytes > 1024:
-                    seg_mp4 = os.path.join(DOWNLOAD_DIR, f"live_{bg_id}_seg{seg_num:03d}.mp4")
-                    logger.info(f"[LIVE:{bg_id}] Final segment {seg_num}: {seg_bytes/(1024*1024):.1f}MB (total: {total_bytes/(1024*1024):.0f}MB)")
-                    fromstart_upload_tasks.append(
-                        asyncio.create_task(
-                            _remux_and_upload_bg(bg_id, seg_path, seg_mp4, seg_num, is_final=True)
-                        )
-                    )
-                else:
-                    try: os.remove(seg_path)
-                    except: pass
-            elif seg_path and os.path.exists(seg_path) and os.path.getsize(seg_path) > 1024:
-                # Edge case: segment was closed by size limit but we need to mark last uploaded as final
-                pass
-
-            # Wait for proc to finish if still running
-            if proc.returncode is None:
                 try:
-                    await asyncio.wait_for(proc.wait(), timeout=5)
-                except asyncio.TimeoutError:
-                    await _kill_process(proc, bg_id)
+                    segment_proc.stdin.write(chunk)
+                    await asyncio.wait_for(segment_proc.stdin.drain(), timeout=30)
+                except (BrokenPipeError, ConnectionResetError, asyncio.TimeoutError) as exc:
+                    logger.error("[LIVE:%s] ffmpeg segmenter stopped accepting data: %s", bg_id, exc)
+                    break
+                await _enqueue_closed_segments()
 
-            if proc.returncode not in (None, 0) and not cancelled and not got_data:
-                logger.warning(
-                    f"[LIVE:{bg_id}] From-start process exited rc={proc.returncode} before producing data"
-                )
-                await live_status(
-                    "⚠️ From-start archive is unavailable (DVR/VOD is not enabled).\n"
-                    "🔴 Continuing to record from the current live position."
-                )
-
-            if fromstart_upload_tasks:
-                if cancelled:
-                    for upload_task in fromstart_upload_tasks:
-                        upload_task.cancel()
-                await asyncio.gather(*fromstart_upload_tasks, return_exceptions=True)
-
-            _cleanup_live_files(bg_id)
-            logger.info(f"[LIVE:{bg_id}] Complete. Segments: {seg_num}, Total: {total_bytes/(1024*1024):.1f}MB")
-
-        return got_data
-
-    async def _remux_and_upload_bg(bg_id, ts_path, mp4_path, seg_num, is_final=False):
-        """Remux a from-start segment and upload."""
-        try:
-            ts_size = os.path.getsize(ts_path) if os.path.exists(ts_path) else 0
-            if ts_size == 0:
-                try: os.remove(ts_path)
-                except: pass
-                return
-            logger.info(f"[LIVE:{bg_id}] Remuxing seg {seg_num}: {ts_size/(1024*1024):.1f}MB")
-            remux = await asyncio.create_subprocess_exec(
-                get_ffmpeg_command(), '-y',
-                '-err_detect', 'ignore_err',
-                '-fflags', '+genpts+discardcorrupt',
-                '-i', ts_path,
-                '-c', 'copy', '-movflags', '+faststart', mp4_path,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
+        except Exception as exc:
+            logger.error("[LIVE:%s] Archive pipeline error: %s", bg_id, exc, exc_info=True)
+            fromstart_failed.set()
+            fromstart_stable.clear()
+            await live_status(
+                f"❌ From-start archive pipeline failed: {exc}\n"
+                "🔴 Continuing with live-edge recording."
             )
-            await remux.stderr.read()
-            await remux.wait()
-            if remux.returncode != 0:
-                remux2 = await asyncio.create_subprocess_exec(
-                    get_ffmpeg_command(), '-y',
-                    '-err_detect', 'ignore_err',
-                    '-fflags', '+genpts+discardcorrupt',
-                    '-i', ts_path,
-                    '-c', 'copy', mp4_path,
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
-                )
-                await remux2.wait()
-            try: os.remove(ts_path)
-            except: pass
+        finally:
+            if source_proc and source_proc.returncode is None:
+                await _kill_process(source_proc, bg_id)
+            if segment_proc:
+                try:
+                    if segment_proc.stdin and not segment_proc.stdin.is_closing():
+                        segment_proc.stdin.close()
+                        await segment_proc.stdin.wait_closed()
+                    await asyncio.wait_for(segment_proc.wait(), timeout=60)
+                except asyncio.TimeoutError:
+                    logger.error("[LIVE:%s] ffmpeg segmenter did not stop after input EOF", bg_id)
+                    segment_proc.kill()
+                    await segment_proc.wait()
+                except Exception as exc:
+                    logger.error("[LIVE:%s] Error stopping segmenter: %s", bg_id, exc)
 
-            if os.path.exists(mp4_path) and os.path.getsize(mp4_path) > 0:
-                title = f"⏪ {channel_name} - From Start Part {seg_num}"
-                if is_final:
-                    # This worker can EOF because its proxy vanished. The
-                    # controller owns end-of-stream confirmation, so never
-                    # label an archive fragment as the live stream's end.
-                    title += " (Archive final segment)"
-                logger.info(f"[LIVE:{bg_id}] Uploading seg {seg_num}: {os.path.getsize(mp4_path)/(1024*1024):.1f}MB")
-                await handle_upload(
-                    application, chat_id, mp4_path, title, url, False, None,
-                    channel_name, message_id, allow_audio_download=False,
-                )
-                logger.info(f"[LIVE:{bg_id}] Upload done seg {seg_num}")
+            if source_proc:
+                try:
+                    await asyncio.wait_for(source_proc.wait(), timeout=10)
+                except asyncio.TimeoutError:
+                    await _kill_process(source_proc, bg_id)
+                if source_proc.returncode not in (0, None):
+                    logger.warning(
+                        "[LIVE:%s] yt-dlp exited rc=%s: %s",
+                        bg_id, source_proc.returncode,
+                        source_stderr.decode(errors='replace').strip()[-800:],
+                    )
+            if segment_proc and segment_proc.returncode not in (0, None):
+                reason = segment_stderr.decode(errors='replace').strip()[-1200:]
+                logger.error("[LIVE:%s] ffmpeg segmenter exited rc=%s: %s", bg_id, segment_proc.returncode, reason)
+                fromstart_failed.set()
+                fromstart_stable.clear()
+
+            for task in stderr_tasks:
+                if not task.done():
+                    await task
+
+            await _enqueue_closed_segments()
+            # A clean ffmpeg exit closes the final TS file before it updates
+            # the CSV manifest. The manifest is authoritative for uploads.
+            fromstart_recording_done.set()
+            if cancelled:
+                consumer_cancelled = True
+                consumer_task.cancel()
+                await asyncio.gather(consumer_task, return_exceptions=True)
             else:
-                logger.error(f"[LIVE:{bg_id}] Remux produced no output for seg {seg_num}")
-        except Exception as e:
-            logger.error(f"[LIVE:{bg_id}] Remux/upload seg {seg_num} error: {e}", exc_info=True)
+                await segment_queue.put(None)
+                await consumer_task
+
+            _cleanup_live_files(bg_id, preserve_paths=failed_paths)
+            _safe_remove(segment_list_path)
+            logger.info(
+                "[LIVE:%s] Archive pipeline complete: data=%.1fMB chunks=%s cancelled=%s",
+                bg_id, total_bytes / (1024 * 1024), len(enqueued_paths), cancelled,
+            )
+
+        if not got_data and not cancelled:
+            detail = source_stderr.decode(errors='replace').strip()[-800:]
+            logger.warning("[LIVE:%s] From-start archive had no data: %s", bg_id, detail)
+            await live_status(
+                "⚠️ From-start archive is unavailable (DVR/VOD is not enabled).\n"
+                "🔴 Continuing to record from the current live position."
+            )
+        elif segment_proc and segment_proc.returncode not in (0, None) and not cancelled:
+            await live_status(
+                "❌ From-start archive could not be finalized.\n"
+                "🔴 Continuing to record from the current live position."
+            )
+        return got_data
 
     async def _concat_parts(part_files, output_ts):
         """Concatenate multiple .ts part files using binary concat (TS is designed for this)."""
@@ -989,36 +1180,48 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                 return
 
             logger.info(f"[LIVE:{task_id}] BG remux seg {seg_num}: {ts_size/(1024*1024):.1f}MB")
-            remux = await asyncio.create_subprocess_exec(
-                get_ffmpeg_command(), '-y',
-                '-err_detect', 'ignore_err',
-                '-fflags', '+genpts+discardcorrupt',
-                '-i', ts_path,
-                '-c', 'copy', '-movflags', '+faststart', mp4_path,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            await remux.stderr.read()
-            await remux.wait()
-            if remux.returncode != 0:
-                remux2 = await asyncio.create_subprocess_exec(
+            remux_stderr_tail = bytearray()
+
+            async def _attempt_remux(include_faststart):
+                args = [
                     get_ffmpeg_command(), '-y',
                     '-err_detect', 'ignore_err',
                     '-fflags', '+genpts+discardcorrupt',
-                    '-i', ts_path,
-                    '-c', 'copy', mp4_path,
+                    '-i', ts_path, '-c', 'copy',
+                ]
+                if include_faststart:
+                    args += ['-movflags', '+faststart']
+                args.append(mp4_path)
+                process = await asyncio.create_subprocess_exec(
+                    *args,
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.PIPE,
                 )
-                await remux2.stderr.read()
-                await remux2.wait()
-                if remux2.returncode != 0:
-                    logger.error(f"[LIVE:{task_id}] BG remux seg {seg_num} failed completely")
-                    try: os.remove(ts_path)
-                    except: pass
-                    return
-            try: os.remove(ts_path)
-            except: pass
+                stderr_task = asyncio.create_task(
+                    _drain_process_stderr(process.stderr, remux_stderr_tail)
+                )
+                await process.wait()
+                await stderr_task
+                return process.returncode
+
+            remux_code = await _attempt_remux(True)
+            if remux_code != 0:
+                _safe_remove(mp4_path)
+                remux_code = await _attempt_remux(False)
+
+            output_size = os.path.getsize(mp4_path) if os.path.exists(mp4_path) else 0
+            if remux_code != 0 or output_size <= 1024:
+                live_failed_paths.add(ts_path)
+                reason = remux_stderr_tail.decode(errors='replace').strip()[-1000:]
+                logger.error("[LIVE:%s] Remux produced no valid output for seg %s: %s", task_id, seg_num, reason)
+                await live_status(
+                    f"❌ Live segment {seg_num} could not be packaged.\n"
+                    "Source recording is retained in downloads/.\n"
+                    f"{reason or f'ffmpeg exited with code {remux_code}'}"
+                )
+                _safe_remove(mp4_path)
+                return
+            _safe_remove(ts_path)
 
             upload_size = os.path.getsize(mp4_path) if os.path.exists(mp4_path) else 0
             if upload_size > 0:
@@ -1029,11 +1232,28 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                         'proxy_exhausted': ' (Proxy interrupted)',
                     }.get(completion_reason, ' (End)')
                 logger.info(f"[LIVE:{task_id}] BG uploading seg {seg_num}: {upload_size/(1024*1024):.1f}MB")
-                await handle_upload(
-                    application, chat_id, mp4_path, title, url, False, None,
+                retry_job_ids = set()
+
+                async def _upload_status(text, force=False, retry_job_id=None):
+                    del force
+                    if retry_job_id:
+                        retry_job_ids.add(retry_job_id)
+                        pending_live_upload_retries.add(retry_job_id)
+                    elif text.startswith("✅ Upload complete"):
+                        pending_live_upload_retries.difference_update(retry_job_ids)
+                    await live_status(text, retry_job_id=retry_job_id)
+
+                completed = await handle_upload(
+                    application, chat_id, mp4_path, title, url, False, _upload_status,
                     channel_name, message_id, allow_audio_download=False,
                 )
-                logger.info(f"[LIVE:{task_id}] BG upload done seg {seg_num}")
+                if not completed:
+                    for retry_id in retry_job_ids:
+                        job = _upload_retry_jobs.get(retry_id)
+                        if job:
+                            live_failed_paths.update(job.files_to_upload)
+                            live_failed_paths.add(job.source_file_path)
+                logger.info(f"[LIVE:{task_id}] BG upload returned completed={completed} for seg {seg_num}")
             else:
                 logger.warning(f"[LIVE:{task_id}] BG remux produced empty file seg {seg_num}")
         except Exception as e:
@@ -1205,9 +1425,10 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
             delay = min(max_delay, delay * 2)
 
     try:
+        supports_from_start = not is_twitch_url(url)
         await live_status(
             f"\U0001f534 Starting live recording: {channel_name}\n"
-            "⏪ Starting a parallel archive from the beginning..."
+            + ("⏪ Starting a parallel archive from the beginning..." if supports_from_start else "")
         )
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
@@ -1217,9 +1438,9 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
         uploaded_segments = []
         bg_tasks = []
         live_edge_retired = False
-        # Start this before streamlink.  It must never replace or interrupt the
-        # live-edge recorder until the DVR/VOD stability window has passed.
-        fromstart_task = asyncio.create_task(_download_from_start())
+        # YouTube may provide a DVR archive. Twitch URLs use only the live-edge
+        # recorder because yt-dlp's YouTube archive path does not apply there.
+        fromstart_task = asyncio.create_task(_download_from_start()) if supports_from_start else asyncio.create_task(asyncio.sleep(0))
         bg_tasks.append(fromstart_task)
 
         # Parts accumulate until size limit, then get concat'd into a segment
@@ -1235,7 +1456,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
         process, used_proxy, termination_reason = await _recover_recording(current_part, None)
         if process is None:
             if termination_reason == 'cancelled':
-                await update_status_msg("❌ Live recording cancelled.", force=True)
+                await live_status("❌ Live recording cancelled.")
                 return
             if termination_reason == 'proxy_exhausted':
                 await live_status("⚠️ Proxy recovery timed out before recording could start.\nLive status was not confirmed.")
@@ -1251,7 +1472,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
 
         await live_status(
             f"\U0001f534 Recording live stream: {channel_name}\n"
-            "⏪ Archiving from the beginning in parallel"
+            + ("⏪ Archiving from the beginning in parallel" if supports_from_start else "")
         )
         poll_count = 0
 
@@ -1259,13 +1480,14 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
             # The archive may be primary while its live-edge process has been
             # intentionally stopped. Manual actions still need to be handled.
             if process is None and task_id in cancelled_tasks:
-                await update_status_msg("❌ Live recording cancelled.", force=True)
+                await live_status("❌ Live recording cancelled.")
                 return
             if process is None and task_id in stopped_tasks:
                 termination_reason = 'stopped'
                 break
 
-            if (fromstart_stable.is_set() and not fromstart_recording_done.is_set()
+            if (fromstart_stable.is_set() and not fromstart_failed.is_set()
+                    and not fromstart_recording_done.is_set()
                     and not fromstart_task.done() and not live_edge_retired):
                 logger.info(
                     f"[LIVE:{task_id}] From-start archive is stable; "
@@ -1290,7 +1512,8 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
             # primary. Fall back to the live edge and make a fresh, verified
             # connection instead of treating that worker's EOF as stream end.
             if live_edge_retired:
-                if (fromstart_stable.is_set() and not fromstart_recording_done.is_set()
+                if (fromstart_stable.is_set() and not fromstart_failed.is_set()
+                        and not fromstart_recording_done.is_set()
                         and not fromstart_task.done()):
                     await asyncio.sleep(3)
                     continue
@@ -1303,7 +1526,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                 process, used_proxy, termination_reason = await _recover_recording(current_part, used_proxy)
                 if process is None:
                     if termination_reason == 'cancelled':
-                        await update_status_msg("❌ Live recording cancelled.", force=True)
+                        await live_status("❌ Live recording cancelled.")
                         return
                     break
                 await live_status(f"🔴 Recording live stream: {channel_name}")
@@ -1324,7 +1547,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                     try: os.remove(current_part)
                     except: pass
                     if termination_reason == 'cancelled':
-                        await update_status_msg("❌ Live recording cancelled.", force=True)
+                        await live_status("❌ Live recording cancelled.")
                         return
                     break
                 await live_status(f"🔴 Recording live stream: {channel_name}")
@@ -1336,7 +1559,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                 logger.info(f"[LIVE:{task_id}] Cancel signal")
                 await _kill_process(process, task_id)
                 # Leave the signal in place so the from-start worker cancels too.
-                await update_status_msg("❌ Live recording cancelled.", force=True)
+                await live_status("❌ Live recording cancelled.")
                 return
 
             # Check stop & upload
@@ -1468,12 +1691,9 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                         "✅ Live-edge backup was stopped after the 10-minute safety check."
                     )
                 else:
-                    await update_status_msg(
-                        "⬆️ Uploading live segment(s) and completing the from-start archive...",
-                        force=True,
-                    )
+                    await live_status("⬆️ Uploading live segment(s) and completing the from-start archive...")
             else:
-                await update_status_msg(f"⬆️ Uploading {len(bg_tasks)} segment(s)...", force=True)
+                await live_status(f"⬆️ Uploading {len(bg_tasks)} segment(s)...")
             await asyncio.gather(*bg_tasks, return_exceptions=True)
             bg_tasks.clear()
 
@@ -1484,6 +1704,11 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                 f"⚠️ Proxy recovery timed out after {recovery_minutes} minutes.\n"
                 "Recorded segment(s) were uploaded; the live stream end was not confirmed."
             )
+        elif pending_live_upload_retries or live_failed_paths or fromstart_failed.is_set():
+            await live_status(
+                "⚠️ Live recording ended, but one or more segments need attention.\n"
+                "Pending uploads will retry automatically; failed recordings are retained in downloads/."
+            )
         elif status_msg:
             try: await tg_retry(status_msg.delete)
             except Exception as e:
@@ -1492,7 +1717,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
     except Exception as e:
         logger.error(f"[LIVE:{task_id}] UNHANDLED EXCEPTION: {e}", exc_info=True)
         try:
-            await update_status_msg(f"\U0001f525 Live recording error: {e}", force=True)
+            await live_status(f"\U0001f525 Live recording error: {e}")
         except Exception as e2:
             logger.error(f"[LIVE:{task_id}] Could not send error msg: {e2}", exc_info=True)
     finally:
@@ -1505,17 +1730,20 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
             pass
         stopped_tasks.discard(task_id)
         cancelled_tasks.discard(task_id)
-        _cleanup_live_files(task_id)
+        _cleanup_live_files(task_id, preserve_paths=live_failed_paths)
         _cleanup_partial_downloads()
         _free_memory()
 
 
-def _cleanup_live_files(task_id):
+def _cleanup_live_files(task_id, preserve_paths=None):
     """Remove any leftover live recording segments and temp files.
     When called with main task_id, skips fromstart files (they manage their own cleanup)."""
     is_fromstart = 'fromstart' in task_id
+    preserve_paths = set(preserve_paths or ())
     for f in glob.glob(os.path.join(DOWNLOAD_DIR, f"live_{task_id}*")):
         if not is_fromstart and 'fromstart' in f:
+            continue
+        if f in preserve_paths:
             continue
         try: os.remove(f)
         except: pass

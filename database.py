@@ -91,6 +91,21 @@ def remove_subscription(channel_id: str, chat_id: int, sub_type: str = 'video') 
         logger.error(f"Failed to remove subscription: {e}")
         return False
 
+def remove_legacy_numeric_subscriptions(channel_id: str, chat_id: int) -> int:
+    """Remove this chat's stale platform-less numeric subscription rows."""
+    if not channel_id or not channel_id.isascii() or not channel_id.isdigit():
+        return 0
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.execute(
+                "DELETE FROM subscriptions WHERE channel_id = ? AND chat_id = ?",
+                (channel_id, chat_id),
+            )
+            return cursor.rowcount
+    except Exception as e:
+        logger.error(f"Failed to remove legacy subscription {channel_id}: {e}")
+        return 0
+
 def get_all_subscriptions() -> List[Tuple]:
     """Get all active subscriptions."""
     try:

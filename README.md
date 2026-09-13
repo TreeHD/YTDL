@@ -71,7 +71,7 @@ flowchart LR
 | 一般影片／音樂 | 排進一般佇列，下載後上傳。 |
 | 播放清單 | 排進播放清單佇列，逐部下載，避免大量檔案同時佔空間。 |
 | 訂閱新影片 | 依 `SUBSCRIPTION_CHECK_INTERVAL`（預設 300 秒）檢查頻道，有新片就自動排入佇列。 |
-| 訂閱直播 | 開始時同時錄兩路：streamlink 從現在錄作為保險；yt-dlp 嘗試從直播開頭封存。從頭錄製穩定 10 分鐘後，會停掉 streamlink 並刪除它的重複暫存，最後只傳從頭錄的完整版。沒有 DVR/VOD 時，streamlink 會繼續錄。 |
+| 訂閱直播 | YouTube 開始時同時錄兩路：streamlink 從現在錄作為保險；yt-dlp 嘗試從直播開頭封存。FFmpeg 先把封存串流切成可播放的小段，再累積到接近 1.9GB 後封裝並上傳；封存穩定 10 分鐘後才停掉備援。沒有 DVR/VOD 時，streamlink 分段繼續錄影與上傳。Twitch 只使用 streamlink 即時錄影。 |
 
 直播錄影遇到 Proxy／WARP 中斷時不會直接判定下播。Bot 會輪替所有設定的代理、以退避方式重試，並透過 YouTube metadata 連續兩次確認同一支影片已不在直播，才會上傳為 `(End)`。預設 30 分鐘內仍無法恢復時，會上傳已錄到的片段並標記 `(Proxy interrupted)`，保留狀態訊息說明直播結束尚未確認。
 
@@ -81,19 +81,25 @@ flowchart LR
 flowchart TD
     L[偵測到直播] --> A[建立同一則直播狀態訊息]
     A --> N[streamlink：從現在開始錄]
-    A --> B[yt-dlp --live-from-start：從開頭封存]
+    A --> B[YouTube：yt-dlp --live-from-start]
+    A --> T[Twitch：只錄即時串流]
+    B --> S[FFmpeg 產生完整小片段]
+    S --> G[累積到接近 1.9GB，封裝並上傳]
     B --> C{來源有 DVR / VOD？}
     C -->|有| D[兩路暫時同錄]
     D --> J{從頭錄製穩定 10 分鐘？}
     J -->|是| K[停掉 streamlink／刪除重複暫存]
-    K --> G[只保留從頭錄的完整版]
+    K --> G
     J -->|否／中途失敗| N
-    C -->|沒有| E[顯示提醒，結束從頭封存]
+    C -->|沒有| E[顯示提醒並使用即時錄影]
     E --> N
-    N --> F[目前直播分段上傳]
-    F --> H[直播結束或按 Stop & Upload]
-    G --> H
+    N --> F[即時錄影分段上傳]
+    T --> F
+    G --> H[直播結束或按 Stop & Upload]
+    F --> H
 ```
+
+封裝或 Telegram 上傳失敗會更新同一則狀態訊息；Telegram 暫時性錯誤會保留分段並排程重試。舊的 Twitch 純數字訂閱無法還原頻道名稱，`/subscriptions` 會列出無效項目；用 `/unsubscribe <舊數字ID>` 移除後，以 Twitch 頻道網址重新訂閱。
 
 ## 需要準備什麼？
 

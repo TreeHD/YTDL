@@ -10,11 +10,12 @@ import queue_processor as qp
 
 
 class FakeProcess:
-    def __init__(self, returncode=None, stdout=None):
+    def __init__(self, returncode=None, stdout=None, stdin=None):
         self.returncode = returncode
         self.pid = 123
         self.stdout = stdout
         self.stderr = SimpleNamespace(read=AsyncMock(return_value=b''))
+        self.stdin = stdin
 
     def send_signal(self, signal):
         self.returncode = 0
@@ -77,11 +78,47 @@ class TestLiveRecording(unittest.IsolatedAsyncioTestCase):
             if scenario == 'archive_eof' and 'From Start' in args[3]:
                 archive_upload_started.set()
                 await resumed.wait()
+            return True
 
         with tempfile.TemporaryDirectory() as directory:
+            class FakeStdin:
+                def __init__(self, segment_path, list_path):
+                    self.segment_path = segment_path
+                    self.list_path = list_path
+                    self.written = 0
+                    self.closed = False
+
+                def write(self, data):
+                    self.written += len(data)
+                    if self.written >= 1024 and not os.path.exists(self.segment_path):
+                        with open(self.segment_path, 'wb') as output:
+                            output.write(b'x' * 2048)
+                        with open(self.list_path, 'w') as listing:
+                            listing.write(f'{os.path.basename(self.segment_path)},0,60\n')
+
+                async def drain(self):
+                    return None
+
+                def is_closing(self):
+                    return self.closed
+
+                def close(self):
+                    self.closed = True
+
+                async def wait_closed(self):
+                    return None
+
             async def spawn(*cmd, **kwargs):
                 if cmd[0] == 'yt-dlp':
                     return archive
+                if cmd[0] == 'ffmpeg' and '-segment_list' in cmd:
+                    pattern = cmd[-1]
+                    segment_path = pattern.replace('%06d', '000001')
+                    list_path = cmd[cmd.index('-segment_list') + 1]
+                    return FakeProcess(
+                        returncode=0,
+                        stdin=FakeStdin(segment_path, list_path),
+                    )
                 if cmd[0] == 'streamlink':
                     proc = FakeProcess()
                     recorders.append(proc)
@@ -106,7 +143,7 @@ class TestLiveRecording(unittest.IsolatedAsyncioTestCase):
                         media.truncate(size)
                     return proc
                 with open(cmd[-1], 'wb') as media:
-                    media.write(b'mp4')
+                    media.write(b'm' * 2048)
                 return FakeProcess(returncode=0)
 
             with ExitStack() as stack:
@@ -162,6 +199,27 @@ class TestLiveRecording(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(resumed)
         self.assertEqual(len(recorders), 2)
         self.assertTrue(any('Live-edge backup stopped' in text for text in statuses))
+
+    def test_archive_segmenter_outputs_container_aware_closed_chunks(self):
+        command = qp._build_archive_segment_command(
+            'ffmpeg', '/tmp/live_chunk_%06d.ts', '/tmp/live_segments.csv'
+        )
+        self.assertIn('pipe:0', command)
+        self.assertIn('segment', command)
+        self.assertIn('mpegts', command)
+        self.assertIn('copy', command)
+        self.assertEqual(command[command.index('-segment_time') + 1], '60')
+
+    def test_only_closed_segments_from_ffmpeg_manifest_are_consumed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first = os.path.join(directory, 'chunk_000001.ts')
+            with open(first, 'wb') as media:
+                media.write(b'a' * 2048)
+            listing = os.path.join(directory, 'segments.csv')
+            with open(listing, 'w') as output:
+                output.write('chunk_000001.ts,0,60\n')
+                output.write('chunk_000002.ts,60')  # ffmpeg is still writing it
+            self.assertEqual(qp._read_completed_archive_chunks(listing, directory), [first])
 
 
 if __name__ == '__main__':

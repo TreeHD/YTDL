@@ -48,9 +48,26 @@ def _twitch_channel_slug(channel_url):
     return parts[0].lower()
 
 
+def is_twitch_url(url):
+    """Whether a stream URL is hosted on Twitch."""
+    parsed = urlparse(url or '')
+    host = (parsed.hostname or '').lower()
+    return host == 'twitch.tv' or host.endswith('.twitch.tv')
+
+
 def is_twitch_channel_id(channel_id):
     """Whether a persisted subscription ID belongs to Twitch."""
-    return channel_id.startswith(TWITCH_CHANNEL_PREFIX)
+    return isinstance(channel_id, str) and channel_id.startswith(TWITCH_CHANNEL_PREFIX)
+
+
+def is_legacy_numeric_channel_id(channel_id):
+    """Whether a subscription ID is missing YouTube's normal channel prefix.
+
+    Twitch subscriptions created before offline channel parsing stored a
+    numeric Twitch user ID. That ID is not a YouTube channel ID and must never
+    be sent to YouTube's /channel/<id>/ endpoints.
+    """
+    return isinstance(channel_id, str) and channel_id.isascii() and channel_id.isdigit()
 
 
 def probe_live_state(url, expected_video_id=None):
@@ -266,6 +283,9 @@ def get_latest_videos(channel_id, limit=5):
     # Twitch subscriptions are live-only. They must never be queried through
     # YouTube's /channel/<id>/videos endpoint.
     if is_twitch_channel_id(channel_id):
+        return []
+    if is_legacy_numeric_channel_id(channel_id):
+        logger.warning("Skipping legacy numeric subscription ID; it is not a YouTube channel ID")
         return []
 
     proxy_list = get_proxy_list()
@@ -511,6 +531,10 @@ def is_playlist(url):
 
 def get_live_info(channel_id):
     """Check a channel's live endpoint without treating lookup errors as off-air."""
+    if is_legacy_numeric_channel_id(channel_id):
+        logger.warning("Skipping live lookup for legacy numeric subscription ID")
+        return LiveProbeResult('UNKNOWN', errors=['Legacy numeric ID has no platform or channel name'])
+
     proxy_list = get_proxy_list()
     is_twitch = is_twitch_channel_id(channel_id)
     live_url = (

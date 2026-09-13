@@ -15,11 +15,13 @@ from telegram.ext import ContextTypes
 from config import load_config, is_user_allowed, check_disk_space, check_ffmpeg
 from database import (
     add_subscription, remove_subscription, get_user_subscriptions,
-    get_all_subscriptions, get_user_settings, update_user_settings
+    get_all_subscriptions, get_user_settings, update_user_settings,
+    remove_legacy_numeric_subscriptions,
 )
 from downloader import (
     download_content, get_video_info, 
-    get_channel_info, get_playlist_info, is_playlist, is_twitch_channel_id
+    get_channel_info, get_playlist_info, is_playlist, is_twitch_channel_id,
+    is_legacy_numeric_channel_id,
 )
 from uploader import upload_video_streaming, upload_audio_streaming, split_video, crop_to_square
 from telegram_utils import tg_retry
@@ -399,6 +401,20 @@ async def handle_unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # Detect sub_type from command
     cmd = update.message.text.split()[0].lower()
     sub_type = 'live' if 'live' in cmd else 'video'
+
+    if is_legacy_numeric_channel_id(channel_url):
+        removed = remove_legacy_numeric_subscriptions(channel_url, chat_id)
+        text = (
+            f"✅ Removed {removed} stale subscription(s) for ID {channel_url}.\n"
+            "Subscribe again with the Twitch channel URL, for example "
+            "`/sublive https://www.twitch.tv/channelname`."
+            if removed else
+            f"No stale subscription found for ID {channel_url}. "
+            "Use the Twitch channel URL to unsubscribe."
+        )
+        await tg_retry(context.bot.send_message, chat_id=chat_id, text=text,
+                       reply_to_message_id=message_id, parse_mode='Markdown')
+        return
     
     try:
         loop = asyncio.get_running_loop()
@@ -443,7 +459,13 @@ async def handle_subscriptions(update: Update, context: ContextTypes.DEFAULT_TYP
     
     text = "📺 **Your Subscriptions**\n\n"
     for channel_id, channel_name, max_quality, sub_type, created_at in subs:
-        icon = "🔴 Live" if sub_type == 'live' else "📹 Video"
+        if is_legacy_numeric_channel_id(channel_id):
+            text += (
+                f"• ⚠️ Invalid old subscription ID `{channel_id}`. "
+                "Remove with `/unsubscribe " + channel_id + "` and add the Twitch URL again.\n"
+            )
+            continue
+        icon = "🔴 Live" if sub_type == 'live' or is_twitch_channel_id(channel_id) else "📹 Video"
         text += f"• {icon}: **{channel_name}** ({max_quality}p)\n"
     
     text += f"\n_Total: {len(subs)} subscriptions_"

@@ -13,7 +13,7 @@ from database import (
     mark_video_processed,
     cleanup_old_processed
 )
-from downloader import get_latest_videos, get_live_info
+from downloader import get_latest_videos, get_live_info, is_twitch_channel_id, is_legacy_numeric_channel_id
 from config import load_config
 from telegram_utils import tg_retry
 
@@ -79,6 +79,12 @@ class SubscriptionMonitor:
         # Group by channel
         channels = {}
         for channel_id, channel_name, chat_id, max_quality, sub_type in subscriptions:
+            if is_legacy_numeric_channel_id(channel_id):
+                logger.warning(
+                    "Skipping legacy subscription ID %s; remove it and subscribe again with the Twitch URL",
+                    channel_id,
+                )
+                continue
             if channel_id not in channels:
                 channels[channel_id] = {
                     'name': channel_name,
@@ -87,7 +93,7 @@ class SubscriptionMonitor:
                 }
             
             sub_info = {'chat_id': chat_id, 'max_quality': max_quality}
-            if sub_type == 'live':
+            if sub_type == 'live' or is_twitch_channel_id(channel_id):
                 channels[channel_id]['live_subs'].append(sub_info)
             else:
                 channels[channel_id]['video_subs'].append(sub_info)

@@ -1,7 +1,10 @@
 import os
 import unittest
 import sqlite3
-from database import init_db, add_subscription, remove_subscription, get_user_subscriptions, is_video_processed, mark_video_processed
+from database import (
+    init_db, add_subscription, remove_subscription, get_user_subscriptions,
+    is_video_processed, mark_video_processed, remove_legacy_numeric_subscriptions,
+)
 
 class TestDatabase(unittest.TestCase):
     def setUp(self):
@@ -54,6 +57,15 @@ class TestDatabase(unittest.TestCase):
         
         mark_video_processed(video_id, "UC123", "Test Video")
         self.assertTrue(is_video_processed(video_id))
+
+    def test_legacy_numeric_cleanup_is_limited_to_current_chat(self):
+        add_subscription('315460461806', 'Twitch Channel', 999, 720, 'video')
+        add_subscription('315460461806', 'Twitch Channel', 999, 1080, 'live')
+        add_subscription('315460461806', 'Other Chat', 1000, 1080, 'live')
+
+        self.assertEqual(remove_legacy_numeric_subscriptions('315460461806', 999), 2)
+        self.assertEqual(len(get_user_subscriptions(999)), 0)
+        self.assertEqual(len(get_user_subscriptions(1000)), 1)
 
 if __name__ == '__main__':
     unittest.main()
