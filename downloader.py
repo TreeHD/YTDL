@@ -29,6 +29,11 @@ class LiveProbeResult:
 
 TWITCH_CHANNEL_PREFIX = 'twitch:'
 
+# Download titles can exceed filesystem filename limits, especially for CJK
+# titles. Keep disk filenames stable and short; the original title is still
+# returned from yt-dlp for Telegram messages and upload captions.
+DOWNLOAD_OUTTMPL = f'{DOWNLOAD_DIR}/%(id)s.%(ext)s'
+
 
 def _twitch_channel_slug(channel_url):
     """Return the Twitch channel name for a channel URL, if it is one.
@@ -351,7 +356,7 @@ def download_content(url, progress_callback=None, audio_only=False, audio_format
         
         if audio_only:
             ydl_opts = {
-                'outtmpl': f'{DOWNLOAD_DIR}/%(title).80s [%(id)s].%(ext)s',
+                'outtmpl': DOWNLOAD_OUTTMPL,
                 'format': 'bestaudio/best',
                 'postprocessors': [
                     {
@@ -373,7 +378,7 @@ def download_content(url, progress_callback=None, audio_only=False, audio_format
                             }
         else:
             ydl_opts = {
-                'outtmpl': f'{DOWNLOAD_DIR}/%(title).80s [%(id)s].%(ext)s',
+                'outtmpl': DOWNLOAD_OUTTMPL,
                 'format': f'bestvideo[height<={max_height}][vcodec!~=av01]+bestaudio/best[height<={max_height}]/best',
                 'merge_output_format': 'mp4',
                 'noplaylist': True,

@@ -1,9 +1,18 @@
 import unittest
 from unittest.mock import patch
 
-from downloader import is_retryable_error, probe_live_state
+from downloader import (
+    DOWNLOAD_OUTTMPL,
+    is_retryable_error,
+    probe_live_state,
+)
 
 class TestDownloaderUtils(unittest.TestCase):
+    def test_download_template_uses_only_the_stable_video_id(self):
+        """Long titles must not affect media or temporary .part filenames."""
+        self.assertTrue(DOWNLOAD_OUTTMPL.endswith('/%(id)s.%(ext)s'))
+        self.assertNotIn('%(title)', DOWNLOAD_OUTTMPL)
+
     def test_retryable_error_detection(self):
         self.assertTrue(is_retryable_error("This video is not available in your country"))
         self.assertTrue(is_retryable_error("The uploader has not made this video available in your country"))
