@@ -11,21 +11,14 @@
 
 1. 到 [@BotFather](https://t.me/BotFather) 建立 Bot，取得 `BOT_TOKEN`。
 2. 到 [my.telegram.org](https://my.telegram.org/) 的 **API development tools** 建立 application，取得 `TELEGRAM_API_ID` 與 `TELEGRAM_API_HASH`。
-3. 在專案資料夾建立 `.env`：
+3. 選擇其中一條設定路線：
 
-   ```bash
-   cp .env.example .env
-   ```
+   - **路線 A（推薦）— 設定精靈**：執行 `./setup.sh`，依序回答 WARP／Cookie 選項並輸入 Telegram 憑證。
+   - **路線 B — 手動設定**：複製 `.env.example` 成 `.env`，自行填入 Telegram 憑證與選用設定。
 
-4. 編輯 `.env`，至少填好這三個值：
+   兩條路線的完整操作都在下方「第一次安裝」說明。
 
-   ```env
-   BOT_TOKEN=貼上_BotFather_給你的_token
-   TELEGRAM_API_ID=你的_api_id
-   TELEGRAM_API_HASH=你的_api_hash
-   ```
-
-5. 建置並啟動：
+4. 建置並啟動：
 
    ```bash
    docker build -t ghcr.io/treehd/ytdl:latest .
@@ -33,7 +26,7 @@
    docker-compose logs -f ytdl-bot
    ```
 
-6. 在 Telegram 對 Bot 輸入 `/start`，或直接貼一個影片網址。
+5. 在 Telegram 對 Bot 輸入 `/start`，或直接貼一個影片網址。
 
 如果日誌最後出現 `Bot is running...`，就完成了。按 `Ctrl+C` 只會停止看日誌，不會停止容器。
 
@@ -147,7 +140,36 @@ cd /mnt/HDD/YTDL
 
 這兩個值供本專案的 Local Bot API Server 使用，讓 Bot 能處理接近 2GB 的檔案。
 
-### 4. 建立並填寫 `.env`
+### 4. 設定 `.env`（二選一）
+
+請只選擇以下其中一條路線執行。
+
+#### 路線 A（推薦）：使用設定精靈
+
+```bash
+chmod +x setup.sh
+./setup.sh
+```
+
+設定精靈會自動產生 `.env`，並將檔案權限設為 `600`。如果原本已有 `.env`，會先建立帶時間戳的備份再重建。
+
+精靈中的三個 Telegram 欄位來源如下：
+
+- `BOT_TOKEN`：開啟 [@BotFather](https://t.me/BotFather)，輸入 `/newbot`，依指示建立 Bot 後複製 token。不要把 token 貼到公開聊天室、README、Git commit 或截圖。
+- `TELEGRAM_API_ID` 與 `TELEGRAM_API_HASH`：登入 [my.telegram.org](https://my.telegram.org/)，進入 **API development tools**，建立 application 後複製 `api_id` 與 `api_hash`。
+- Cloudflare WARP：選擇使用時，精靈會設定內建 `warp-proxy` 的 proxy；不使用時會將 `PROXY_LIST` 留空。
+- Cookie：選擇使用時，請先從瀏覽器匯出 yt-dlp 支援的 Netscape 格式 `cookies.txt`，再放到 `data/cookies.txt`：
+
+  ```bash
+  cp /你的/cookies.txt data/cookies.txt
+  chmod 600 data/cookies.txt
+  ```
+
+`TELEGRAM_API_ID` 與 `TELEGRAM_API_HASH` 是 Local Telegram Bot API Server 使用的資料，搭配本專案預設的 `API_URL` 可支援接近 2GB 的檔案。
+
+#### 路線 B：手動設定 `.env`
+
+不想使用設定精靈時，依下列步驟手動建立配置。
 
 ```bash
 cp .env.example .env
@@ -157,8 +179,11 @@ chmod 600 .env
 用任何文字編輯器打開 `.env`：
 
 ```env
-# 必填
+# 必填：BOT_TOKEN 從 @BotFather 的 /newbot 取得
 BOT_TOKEN=123456789:AAExampleReplaceThisWithYourRealToken
+
+# Local Telegram Bot API 必填：從 my.telegram.org → API development tools 取得
+API_URL=http://host.docker.internal:8081/bot
 TELEGRAM_API_ID=12345678
 TELEGRAM_API_HASH=請貼上_api_hash
 
@@ -172,7 +197,18 @@ PROXY_LIST=socks5://warpuser:warppass@warp-proxy:1080
 MAX_DISK_GB=10
 ```
 
-取得自己的 Telegram chat ID，可使用可信的查詢 Bot；群組 ID 通常是負數。`ALLOWED_CHAT_IDS` 可放多個值，以逗號分隔：
+手動設定時的選用項目：
+
+- 不使用 Cloudflare WARP：將 `PROXY_LIST` 改為空值：`PROXY_LIST=`。
+- 使用 Cookie：從瀏覽器匯出 yt-dlp 支援的 Netscape 格式 `cookies.txt`，並放到 `data/cookies.txt`：
+
+  ```bash
+  mkdir -p data
+  cp /你的/cookies.txt data/cookies.txt
+  chmod 600 data/cookies.txt
+  ```
+
+- `ALLOWED_CHAT_IDS` 留空時，任何人都能使用 Bot；建議填入自己的 chat ID。可使用可信的查詢 Bot 取得自己的 ID，群組 ID 通常是負數。多個 ID 以逗號分隔：
 
 ```env
 ALLOWED_CHAT_IDS=123456789,-1001234567890
@@ -393,6 +429,7 @@ YTDL/
 ├── config.py              # .env 設定讀取與空間檢查
 ├── upgrader.py            # yt-dlp nightly 更新排程
 ├── telegram_utils.py      # Telegram API 重試與 flood-control 處理
+├── setup.sh                # 互動式建立 .env 的設定精靈
 ├── docker-compose.yml     # 四個容器的編排
 ├── Dockerfile             # ytdl-bot 本機 image 建置方式
 ├── .env.example           # 可複製的設定範本
