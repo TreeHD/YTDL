@@ -35,6 +35,7 @@ COPY docker-entrypoint.sh .
 RUN mkdir -p /app/data /app/downloads
 
 ENV PYTHONMALLOC=malloc
+ENV LANG=C.UTF-8 LC_ALL=C.UTF-8 PYTHONUTF8=1 PYTHONIOENCODING=utf-8
 ENV PATH="/opt/deno/bin:${PATH}"
 
 RUN chmod +x /app/docker-entrypoint.sh

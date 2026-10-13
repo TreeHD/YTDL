@@ -439,6 +439,22 @@ YTDL/
 
 ## 常見問題
 
+### 中文檔名、VPS 語系與 `Deleting original file`
+
+上傳到 Telegram 時，影片與音訊的檔名會使用影片標題，檔名主體最多 70 字（不含副檔名），分段會附上 ` (Part 1)` 等編號並計入上限。中文與 emoji 保留，路徑分隔符、控制字元及常見不合法字元會替換成 `_`；完整檔名也限制在 255 UTF-8 bytes 內。一般 API 與 Local Bot API 使用相同規則，只修改上傳檔名，不重新命名磁碟上的 ID 暫存檔。
+
+容器固定使用 Debian 的 `C.UTF-8`，並啟用 Python UTF-8 模式；入口程式會覆蓋 `.env` 或宿主傳入的語系，並檢查實際編碼。中文、其他語言與 emoji 的標題仍保留在 Telegram caption／音訊 title。無須把 VPS 改成 Big5；Big5 無法表示所有語言與 emoji。
+
+`downloads/` 的暫存檔刻意使用影片 ID（例如 `f_78K8u7QIU.mp4`），避免長標題造成檔案系統限制。這不是中文標題遺失。yt-dlp 的 `Deleting original file ...webm (pass -k to keep)` 表示轉檔完成後刪除來源檔；程式會確認最終媒體檔存在且非空才回報成功。UTF-8 無法修復不支援 Unicode 的特殊掛載磁碟，遇到這種情況請改用 VPS 的一般 Linux 磁碟作為 `downloads/` volume。
+
+套用更新需重新建置 image 並重建容器：
+
+```bash
+docker build -t ghcr.io/treehd/ytdl:latest .
+docker-compose up -d --build --force-recreate
+docker-compose logs -f ytdl-bot
+```
+
 ### Bot 沒反應
 
 ```bash

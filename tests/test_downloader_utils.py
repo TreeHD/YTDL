@@ -1,13 +1,40 @@
 import unittest
+import os
+import tempfile
 from unittest.mock import patch
 
 from downloader import (
     DOWNLOAD_OUTTMPL,
+    download_content,
     is_retryable_error,
     probe_live_state,
 )
 
 class TestDownloaderUtils(unittest.TestCase):
+    def test_postprocessed_output_preserves_title_and_rejects_missing_media(self):
+        title = '繁體中文 日本語 🎵' * 40
+        with tempfile.TemporaryDirectory() as directory, \
+             patch('downloader.get_proxy_list', return_value=[None]), \
+             patch('downloader.yt_dlp.YoutubeDL') as youtube_dl:
+            source = os.path.join(directory, 'f_78K8u7QIU.webm')
+            output = os.path.join(directory, 'f_78K8u7QIU.mp4')
+            ydl = youtube_dl.return_value.__enter__.return_value
+            ydl.extract_info.return_value = {
+                'id': 'f_78K8u7QIU', 'title': title, 'ext': 'webm',
+            }
+            ydl.prepare_filename.return_value = source
+            with open(output, 'wb') as media:
+                media.write(b'media')
+            result = download_content('https://example.test/video')
+            self.assertEqual(result[:3], (output, title, 'f_78K8u7QIU'))
+            os.remove(output)
+            with self.assertRaisesRegex(FileNotFoundError, 'missing or empty'):
+                download_content('https://example.test/video')
+            with open(output, 'wb'):
+                pass
+            with self.assertRaisesRegex(FileNotFoundError, 'missing or empty'):
+                download_content('https://example.test/video')
+
     def test_download_template_uses_only_the_stable_video_id(self):
         """Long titles must not affect media or temporary .part filenames."""
         self.assertTrue(DOWNLOAD_OUTTMPL.endswith('/%(id)s.%(ext)s'))

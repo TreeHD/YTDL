@@ -19,6 +19,7 @@ from downloader import (
     probe_live_state, restart_warp_proxy, is_twitch_url,
 )
 from uploader import (
+    build_upload_filename,
     upload_video_streaming,
     upload_audio_streaming,
     split_video,
@@ -258,6 +259,10 @@ async def _upload_one_part(job, part_index):
     bot_token = config.get('bot_token', '')
     is_local_api = api_url and 'api.telegram.org' not in api_url
     caption = _caption_for_upload_part(job, part_index)
+    upload_filename = build_upload_filename(
+        file_path, job.title,
+        part_number=part_index + 1 if len(job.files_to_upload) > 1 else None,
+    )
 
     if job.audio_only:
         if is_local_api:
@@ -265,6 +270,7 @@ async def _upload_one_part(job, part_index):
                 bot_token, api_url, job.chat_id, file_path, job.title, caption,
                 reply_to_message_id=job.reply_to_message_id, thumb_path=job.thumb_path,
                 max_retries=1,
+                upload_filename=upload_filename,
             )
             return
 
@@ -277,6 +283,7 @@ async def _upload_one_part(job, part_index):
                     job.application.bot.send_audio,
                     chat_id=job.chat_id,
                     audio=media_fh,
+                    filename=upload_filename,
                     title=job.title,
                     caption=caption,
                     reply_to_message_id=job.reply_to_message_id,
@@ -295,6 +302,7 @@ async def _upload_one_part(job, part_index):
             bot_token, api_url, job.chat_id, file_path, caption, raw_markup,
             reply_to_message_id=job.reply_to_message_id, thumb_path=job.thumb_path,
             max_retries=1,
+            upload_filename=upload_filename,
         )
         return
 
@@ -307,6 +315,7 @@ async def _upload_one_part(job, part_index):
                 job.application.bot.send_video,
                 chat_id=job.chat_id,
                 video=media_fh,
+                filename=upload_filename,
                 caption=caption,
                 supports_streaming=True,
                 reply_markup=telegram_markup,

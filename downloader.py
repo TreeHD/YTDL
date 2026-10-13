@@ -441,6 +441,12 @@ def download_content(url, progress_callback=None, audio_only=False, audio_format
                         filename = alt
                 
                 # Handle thumbnail path
+                # Postprocessors normally delete their source files. Never
+                # report success unless the resolved output actually survived.
+                if not os.path.isfile(filename) or os.path.getsize(filename) == 0:
+                    raise FileNotFoundError(
+                        f"Downloaded media output is missing or empty after postprocessing: {filename}"
+                    )
                 thumb_path = None
                 base_no_ext, _ = os.path.splitext(filename)
                 # yt-dlp often creates .jpg or .webp

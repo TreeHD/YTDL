@@ -8,6 +8,7 @@ import json
 import logging
 import subprocess
 import asyncio
+import unicodedata
 import aiohttp
 import aiofiles
 
@@ -15,6 +16,22 @@ from config import load_config, LOCAL_API_LIMIT, get_ffmpeg_command, check_ffmpe
 from PIL import Image
 
 logger = logging.getLogger(__name__)
+
+
+def build_upload_filename(file_path, title, part_number=None):
+    """Name the upload without renaming ID-based files on disk."""
+    extension = os.path.splitext(file_path)[1]
+    title = unicodedata.normalize('NFC', title or '')
+    title = ''.join(
+        '_' if char in '/\\:*?"<>|' or unicodedata.category(char) == 'Cc' else char
+        for char in title
+    ).strip(' .') or 'video'
+    suffix = f' (Part {part_number})' if part_number is not None else ''
+    # Also fit common 255-byte filesystems when recipients save the upload.
+    title = title[:max(0, 70 - len(suffix))]
+    budget = 255 - len((suffix + extension).encode('utf-8'))
+    title = title.encode('utf-8')[:budget].decode('utf-8', errors='ignore').rstrip(' .')
+    return f'{title or "video"}{suffix}{extension}'
 
 
 class UploadRetryableError(Exception):
@@ -233,11 +250,11 @@ def split_video(file_path, max_size_bytes=None):
     return [file_path]
 
 # --- Streaming Upload Functions ---
-async def upload_video_streaming(bot_token, api_url, chat_id, file_path, caption="", reply_markup=None, reply_to_message_id=None, thumb_path=None, max_retries=RAW_UPLOAD_MAX_RETRIES):
+async def upload_video_streaming(bot_token, api_url, chat_id, file_path, caption="", reply_markup=None, reply_to_message_id=None, thumb_path=None, max_retries=RAW_UPLOAD_MAX_RETRIES, upload_filename=None):
     """Upload video using streaming to minimize RAM usage."""
     endpoint = f"{api_url}{bot_token}/sendVideo"
     
-    file_name = os.path.basename(file_path)
+    file_name = upload_filename or os.path.basename(file_path)
     file_size = os.path.getsize(file_path)
     
     logger.info(f"Chunked streaming upload: {file_name} ({file_size / 1024 / 1024:.2f} MB)")
@@ -288,11 +305,11 @@ async def upload_video_streaming(bot_token, api_url, chat_id, file_path, caption
 
     return await _retry_raw_upload(make_request, f"Video upload {file_name}", max_retries=max_retries)
 
-async def upload_audio_streaming(bot_token, api_url, chat_id, file_path, title="", caption="", reply_to_message_id=None, thumb_path=None, max_retries=RAW_UPLOAD_MAX_RETRIES):
+async def upload_audio_streaming(bot_token, api_url, chat_id, file_path, title="", caption="", reply_to_message_id=None, thumb_path=None, max_retries=RAW_UPLOAD_MAX_RETRIES, upload_filename=None):
     """Upload audio using streaming to minimize RAM usage."""
     endpoint = f"{api_url}{bot_token}/sendAudio"
     
-    file_name = os.path.basename(file_path)
+    file_name = upload_filename or build_upload_filename(file_path, title)
     file_size = os.path.getsize(file_path)
     
     logger.info(f"Streaming audio upload: {file_name} ({file_size / 1024 / 1024:.2f} MB)")
