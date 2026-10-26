@@ -1,4 +1,4 @@
-yt-dlp==2026.8.19
+yt-dlp==2026.10.21
 streamlink
 python-telegram-bot
 aiohttp
