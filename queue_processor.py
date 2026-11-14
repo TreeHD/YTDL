@@ -30,7 +30,7 @@ from uploader import (
     UploadPermanentError,
 )
 from handlers import cancelled_tasks, stopped_tasks
-from telegram_utils import tg_retry
+from telegram_utils import tg_retry, StatusMessageEditor
 
 logger = logging.getLogger(__name__)
 
@@ -566,6 +566,7 @@ async def process_queue(application, request_queue):
             task_id = f"{chat_id}_{message_id}_{int(time.time())}"
             status_msg = status_msg_passed
             last_edit_time = 0
+            status_editor = StatusMessageEditor()
             
             async def update_status_msg(text, force=False, show_cancel=False, retry_job_id=None):
                 nonlocal status_msg, last_edit_time
@@ -582,9 +583,8 @@ async def process_queue(application, request_queue):
                         ])
                     reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
                     if status_msg:
-                        if status_msg.text != text:
-                            await tg_retry(status_msg.edit_text, text, reply_markup=reply_markup)
-                            last_edit_time = now
+                        await status_editor.edit(status_msg, text, reply_markup=reply_markup)
+                        last_edit_time = now
                     else:
                         status_msg = await tg_retry(application.bot.send_message,
                             chat_id=chat_id, text=text, reply_to_message_id=message_id, reply_markup=reply_markup
@@ -736,6 +736,8 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
             )])
         return InlineKeyboardMarkup(rows)
 
+    live_status_editor = StatusMessageEditor()
+
     async def live_status(text, retry_job_id=None):
         nonlocal status_msg
         try:
@@ -750,8 +752,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
             keyboard = _make_keyboard(retry_job_id)
             logger.info(f"[LIVE:{task_id}] live_status: '{text}'")
             if status_msg:
-                if status_msg.text != text:
-                    await tg_retry(status_msg.edit_text, text, reply_markup=keyboard)
+                await live_status_editor.edit(status_msg, text, reply_markup=keyboard)
             else:
                 status_msg = await tg_retry(
                     application.bot.send_message,
@@ -1787,6 +1788,7 @@ async def process_playlist_queue(application, playlist_queue):
             audio_format = 'mp3' if max_height == -2 else 'm4a'
             
             last_edit_time = 0
+            status_editor = StatusMessageEditor()
             async def update_status_msg(text, force=True, show_cancel=True, send_new=False):
                 nonlocal status_msg, last_edit_time
                 now = time.time()
@@ -1806,9 +1808,8 @@ async def process_playlist_queue(application, playlist_queue):
                         status_msg = None
 
                     if status_msg:
-                        if status_msg.text != text:
-                            await tg_retry(status_msg.edit_text, text, reply_markup=reply_markup)
-                            last_edit_time = now
+                        await status_editor.edit(status_msg, text, reply_markup=reply_markup)
+                        last_edit_time = now
                     else:
                         status_msg = await tg_retry(application.bot.send_message, chat_id=chat_id, text=text, reply_to_message_id=message_id, reply_markup=reply_markup)
                         last_edit_time = now
