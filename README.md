@@ -356,7 +356,7 @@ WARP_PASSWORD=warppass
 
 上傳成功只代表格式與到期時間通過檢查，**不保證登入有效**：網站可能提前撤銷 cookies，或帳號沒有私人／年齡限制影片的權限。傳送目標影片網址即可實測。
 
-錯誤訊息會區分網站明確回報 cookies 失效、登入／權限不足、地區限制、proxy 驗證與網路連線問題。明確的 cookies／登入問題不會觸發 WARP 重啟；機器人驗證、403、429 仍可嘗試其他出口，但會標示 cookies、IP 或限流皆有可能，不再統稱「所有 proxy 故障」。
+錯誤訊息會區分網站明確回報 cookies 失效、登入／權限不足、地區限制、proxy 驗證與網路連線問題。明確的 cookies 撤銷或格式錯誤不會觸發 WARP 重啟；一般登入／權限提示仍會依序嘗試其他 proxy；機器人驗證、403、429 仍可嘗試其他出口，但會標示 cookies、IP 或限流皆有可能，不再統稱「所有 proxy 故障」。
 
 使用 Local Bot API 時，`API_URL` 也會用於檔案下載。Compose 已將 Bot API 檔案目錄唯讀掛載給 bot，支援 `getFile` 回傳本機絕對路徑；外部 Local API 若啟用 local 模式，也需要在 bot 容器提供相同路徑。
 
