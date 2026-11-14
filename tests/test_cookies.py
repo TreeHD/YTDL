@@ -69,8 +69,8 @@ class CookieTests(unittest.TestCase):
                  patch('downloader.get_cookie_file', return_value=None), \
                  patch('downloader.yt_dlp.YoutubeDL') as factory, \
                  patch('downloader.restart_warp_proxy') as restart:
-                factory.return_value.__enter__.return_value.extract_info.side_effect = Exception('cookies are required')
-                with self.assertRaisesRegex(Exception, '帳號權限'):
+                factory.return_value.__enter__.return_value.extract_info.side_effect = Exception('cookies are no longer valid')
+                with self.assertRaisesRegex(Exception, '遭撤銷'):
                     function('https://example.test/video')
                 restart.assert_not_called()
 

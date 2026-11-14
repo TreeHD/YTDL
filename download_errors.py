@@ -15,14 +15,14 @@ def classify_error(error):
     if any(p in text for p in ('proxyerror', 'proxy error', 'proxy authentication required',
                                 'http error 407', 'socks', 'tunnel connection failed')):
         return 'proxy'
-    if any(p in text for p in ('sign in to confirm your age', 'cookies are required',
-                                'login required', 'login_required', 'sign in to',
-                                'private video', 'use --cookies', 'authentication required')):
-        return 'auth'
     if any(p in text for p in ('not available in your country',
                                 'not made this video available in your country',
                                 'geo-restricted', 'geographic restriction')):
         return 'geo'
+    if any(p in text for p in ('sign in to confirm your age', 'cookies are required',
+                                'login required', 'login_required', 'sign in to',
+                                'private video', 'use --cookies', 'authentication required')):
+        return 'auth'
     if any(p in text for p in ('timed out', 'timeout', 'connection refused',
                                 'connection reset', 'could not resolve host',
                                 'name or service not known', 'temporary failure in name resolution')):

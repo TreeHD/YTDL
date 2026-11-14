@@ -9,7 +9,7 @@ import yt_dlp
 from dataclasses import dataclass, field
 from contextlib import contextmanager
 from cookie_manager import cookie_snapshot
-from download_errors import classify_error, error_hint, diagnostic_error
+from download_errors import classify_error, error_hint, diagnostic_error, DownloadDiagnosticError
 
 from config import DOWNLOAD_DIR, get_proxy_list, load_config, get_ffmpeg_command, get_cookie_file
 
@@ -161,17 +161,17 @@ def restart_warp_proxy():
 def is_retryable_error(error_msg, proxy_url=None):
     """Return whether to try another proxy, rotating WARP only when appropriate."""
     kind = classify_error(error_msg)
-    if kind in ('cookie_expired', 'cookie_format', 'auth'):
+    if kind in ('cookie_expired', 'cookie_format'):
         return False
-    error_lower = str(error_msg).lower()
-    is_geo_restriction = any(
+    error_lower = str(getattr(error_msg, 'source', error_msg)).lower()
+    is_geo_restriction = kind == 'geo' or any(
         pattern.lower() in error_lower for pattern in GEO_RESTRICTION_ERRORS
     )
-    matched = kind in ('proxy', 'network', 'blocked') or is_geo_restriction or any(
+    matched = kind in ('proxy', 'network', 'blocked', 'auth') or is_geo_restriction or any(
         pattern.lower() in error_lower for pattern in RETRY_ERRORS
     )
     if matched:
-        logger.info(f"Retryable error matched: {error_msg[:100]}")
+        logger.info(f"Retryable error matched: {str(error_msg)[:100]}")
         if is_geo_restriction:
             logger.info("Geo restriction detected; trying the next proxy without rotating WARP.")
         elif proxy_url and 'warp-proxy' in proxy_url:
@@ -276,7 +276,7 @@ def get_video_info(url):
                 }
         except Exception as e:
             last_error = e
-            if is_retryable_error(str(e)):
+            if is_retryable_error(e):
                 continue
             raise diagnostic_error(e) from e
     
@@ -322,7 +322,7 @@ def get_channel_info(channel_url):
                 }
         except Exception as e:
             last_error = e
-            if is_retryable_error(str(e)):
+            if is_retryable_error(e):
                 continue
             raise diagnostic_error(e) from e
     
@@ -370,7 +370,7 @@ def get_latest_videos(channel_id, limit=5):
                                 'url': entry.get('url') or f"https://www.youtube.com/watch?v={vid_id}",
                             }
         except Exception as e:
-            if is_retryable_error(str(e), proxy):
+            if is_retryable_error(e, proxy):
                 continue
             logger.warning(f"Failed to get latest videos via proxy={proxy}: {e}")
             continue
@@ -504,7 +504,7 @@ def download_content(url, progress_callback=None, audio_only=False, audio_format
                 return filename, info.get('title', 'video'), info.get('id', ''), thumb_path
                 
         except Exception as e:
-            last_error = str(e)
+            last_error = e
             
             if is_retryable_error(last_error, proxy):
                 # If geo-restricted or bot detected, try next proxy
@@ -515,7 +515,8 @@ def download_content(url, progress_callback=None, audio_only=False, audio_format
                 logger.error(f"Non-geo error, stopping retry: {last_error}")
                 raise diagnostic_error(e) from e
     
-    raise diagnostic_error(last_error or 'Download failed without a result')
+    error = diagnostic_error(last_error or 'Download failed without a result')
+    raise DownloadDiagnosticError(f'已嘗試全部 {len(proxy_list)} 個連線（含直連，如有設定）。最後錯誤：{error}') from last_error
 
 # --- Playlist Info ---
 def get_playlist_info(url):
@@ -550,7 +551,7 @@ def get_playlist_info(url):
                 }
         except Exception as e:
             last_error = e
-            if is_retryable_error(str(e), proxy):
+            if is_retryable_error(e, proxy):
                 continue
             raise diagnostic_error(e) from e
     
@@ -577,7 +578,7 @@ def is_playlist(url):
                 # ie_key is usually present for nested items, we want the top level to be a playlist
                 return 'entries' in info and bool(info.get('entries'))
         except Exception as e:
-            if is_retryable_error(str(e), proxy):
+            if is_retryable_error(e, proxy):
                 continue
             return False
     return False
