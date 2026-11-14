@@ -21,6 +21,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy all application modules
 COPY bot.py .
 COPY config.py .
+COPY cookie_manager.py .
+COPY download_errors.py .
 COPY database.py .
 COPY downloader.py .
 COPY uploader.py .

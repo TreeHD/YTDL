@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
+from cookie_manager import cookie_snapshot
+from download_errors import classify_error, error_hint
 from config import load_config, check_disk_space, check_ffmpeg, DOWNLOAD_DIR, get_ffmpeg_command, get_proxy_list, get_cookie_file
 from downloader import (
     download_content, get_video_info, get_playlist_info,
@@ -772,7 +774,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
         cmd += [url, 'best']
         return cmd
 
-    def _build_fromstart_cmd(proxy=None):
+    def _build_fromstart_cmd(proxy=None, cookie_file=None):
         """yt-dlp command for from-start download, outputs to stdout."""
         cmd = [
             'yt-dlp',
@@ -787,7 +789,6 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
             '--fragment-retries', '10',
             '-o', '-',
         ]
-        cookie_file = get_cookie_file()
         if cookie_file:
             cmd += ['--cookies', cookie_file]
         if proxy:
@@ -798,6 +799,11 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
     # FFmpeg closes each inner TS segment at a stream boundary; the consumer
     # batches those files to preserve the existing ~1.9GiB upload cadence.
     async def _download_from_start():
+        # The subprocess can save cookies on exit; isolate it from new uploads.
+        with cookie_snapshot(get_cookie_file()) as snapshot:
+            return await _download_from_start_snapshot(snapshot)
+
+    async def _download_from_start_snapshot(snapshot):
         bg_id = f"{task_id}_fromstart"
         segment_list_path = os.path.join(DOWNLOAD_DIR, f"live_{bg_id}_segments.csv")
         segment_pattern = os.path.join(DOWNLOAD_DIR, f"live_{bg_id}_chunk_%06d.ts")
@@ -975,7 +981,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
         for proxy in get_proxy_list():
             try:
                 source_proc = await asyncio.create_subprocess_exec(
-                    *_build_fromstart_cmd(proxy),
+                    *_build_fromstart_cmd(proxy, snapshot),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
@@ -1138,7 +1144,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
             detail = source_stderr.decode(errors='replace').strip()[-800:]
             logger.warning("[LIVE:%s] From-start archive had no data: %s", bg_id, detail)
             await live_status(
-                "⚠️ From-start archive is unavailable (DVR/VOD is not enabled).\n"
+                ("⚠️ " + (error_hint(detail) or "From-start archive is unavailable; DVR/VOD may be disabled.") + "\n") +
                 "🔴 Continuing to record from the current live position."
             )
         elif segment_proc and segment_proc.returncode not in (0, None) and not cancelled:
@@ -1413,8 +1419,11 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                 logger.error("[LIVE:%s] Recovery window exhausted after %.0fs", task_id, elapsed)
                 return None, None, 'proxy_exhausted'
 
+            auth_problem = any(classify_error(error) in ('cookie_expired', 'cookie_format', 'auth')
+                               for error in probe.errors)
             if (
-                any(proxy and 'warp-proxy' in proxy for proxy in round_proxies)
+                not auth_problem
+                and any(proxy and 'warp-proxy' in proxy for proxy in round_proxies)
                 and time.monotonic() - last_warp_restart >= warp_cooldown
             ):
                 logger.warning("[LIVE:%s] All recorder proxies failed; restarting WARP", task_id)
@@ -1427,7 +1436,8 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                 remaining = max(0, int(window - elapsed))
                 await live_status(
                     f"⚠️ Reconnecting live recording: {channel_name}\n"
-                    f"Proxy/source unavailable; retrying for up to {remaining}s."
+                    f"Proxy/source unavailable; retrying for up to {remaining}s.\n"
+                    + next((error_hint(error) for error in probe.errors if error_hint(error)), "")
                 )
                 last_status_at = now
             await asyncio.sleep(delay)
@@ -1468,7 +1478,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                 await live_status("❌ Live recording cancelled.")
                 return
             if termination_reason == 'proxy_exhausted':
-                await live_status("⚠️ Proxy recovery timed out before recording could start.\nLive status was not confirmed.")
+                await live_status("⚠️ Proxy/source recovery timed out before recording could start.\nLive status was not confirmed.")
             elif termination_reason == 'confirmed_end':
                 await live_status("✅ Live stream end was confirmed before recording could start.")
             # Do not leave the parallel archive task orphaned when the edge
@@ -1710,7 +1720,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
         if termination_reason == 'proxy_exhausted':
             recovery_minutes = max(1, (load_config()['live_proxy_recovery_window_seconds'] + 59) // 60)
             await live_status(
-                f"⚠️ Proxy recovery timed out after {recovery_minutes} minutes.\n"
+                f"⚠️ Proxy/source recovery timed out after {recovery_minutes} minutes.\n"
                 "Recorded segment(s) were uploaded; the live stream end was not confirmed."
             )
         elif pending_live_upload_retries or live_failed_paths or fromstart_failed.is_set():

@@ -8,6 +8,8 @@ services:
     volumes:
       - ./downloads:/app/downloads
       - ./data:/app/data
+      # Local Bot API getFile may return an absolute path.
+      - ./telegram-bot-api-data:/var/lib/telegram-bot-api:ro
     env_file:
       - .env
     extra_hosts:

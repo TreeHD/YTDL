@@ -26,6 +26,7 @@ from downloader import (
 from uploader import upload_video_streaming, upload_audio_streaming, split_video, crop_to_square
 from telegram_utils import tg_retry
 from upgrader import upgrade_yt_dlp
+from cookie_manager import MAX_COOKIE_BYTES, is_cookie_admin, install_cookies
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +62,7 @@ Send me a URL to download in 1080p (default).
 
 **Maintenance Command:**
 • `/upgrade` - Upgrade yt-dlp to the nightly channel
+• Cookie admins: privately send cookie.txt / cookies.txt to update cookies
 
 **Subscription Commands:**
 • `/subscribe <channel_url>` - Subscribe to a channel
@@ -684,3 +686,41 @@ async def audio_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]))
     finally:
         gc.collect()
+
+
+
+async def handle_cookie_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Only explicitly configured users may replace the shared account cookies."""
+    message = update.effective_message
+    user = update.effective_user
+    chat = update.effective_chat
+    if not message or not message.document or not chat:
+        return
+    if chat.type != 'private' or not user or not is_cookie_admin(user.id):
+        await tg_retry(message.reply_text, '⛔ 僅 COOKIE_ADMIN_IDS 指定的管理者可透過私訊上傳 cookies。')
+        return
+    document = message.document
+    if (document.file_name or '').lower() not in ('cookie.txt', 'cookies.txt'):
+        await tg_retry(message.reply_text, '請上傳名為 cookie.txt 或 cookies.txt 的 Netscape 格式檔案。')
+        return
+    if document.file_size is None or not 0 < document.file_size <= MAX_COOKIE_BYTES:
+        await tg_retry(message.reply_text, '❌ Cookies 檔案不可為空，且不得超過 1 MiB。')
+        return
+    status = await tg_retry(message.reply_text, '🔍 正在檢查 cookies 檔案…')
+    try:
+        remote = await tg_retry(document.get_file)
+        data = await tg_retry(remote.download_as_bytearray)
+        count, expired = await asyncio.get_running_loop().run_in_executor(
+            None, install_cookies, bytes(data)
+        )
+    except ValueError as exc:
+        await tg_retry(status.edit_text, f'❌ {exc}\n原有 cookies 未變更。')
+        return
+    except Exception:
+        # Exceptions from file APIs/parsers may contain private paths or secrets.
+        logger.warning('Cookie upload failed; details withheld to protect credentials')
+        await tg_retry(status.edit_text, '❌ 無法下載或儲存 cookies，請確認檔案服務與 data 目錄權限後重試。')
+        return
+    await tg_retry(status.edit_text,
+        f'✅ 已更新 cookies（{count} 筆，其中 {expired} 筆已到期）。新下載會自動使用，不需重啟。\n'
+        '格式與到期時間檢查通過，但不保證登入仍有效；網站可能提前撤銷登入，請傳送影片網址實測。')
