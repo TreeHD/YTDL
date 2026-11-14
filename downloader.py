@@ -7,6 +7,9 @@ import os
 import logging
 import yt_dlp
 from dataclasses import dataclass, field
+from contextlib import contextmanager
+from cookie_manager import cookie_snapshot
+from download_errors import classify_error, error_hint, diagnostic_error
 
 from config import DOWNLOAD_DIR, get_proxy_list, load_config, get_ffmpeg_command, get_cookie_file
 
@@ -96,7 +99,7 @@ def probe_live_state(url, expected_video_id=None):
             ydl_opts['proxy'] = proxy
         _apply_cookie(ydl_opts)
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            with cookie_youtube_dl(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
             video_id = info.get('id', '')
             if expected_video_id and video_id != expected_video_id:
@@ -106,7 +109,7 @@ def probe_live_state(url, expected_video_id=None):
                 return LiveProbeResult('LIVE', info, errors)
             return LiveProbeResult('ENDED', info, errors)
         except Exception as exc:
-            errors.append(str(exc)[:300])
+            errors.append(str(getattr(exc, 'source', exc))[:300])
     return LiveProbeResult('UNKNOWN', errors=errors)
 
 # Geo restrictions should move directly to the next proxy.  Rotating WARP for
@@ -157,11 +160,14 @@ def restart_warp_proxy():
 
 def is_retryable_error(error_msg, proxy_url=None):
     """Return whether to try another proxy, rotating WARP only when appropriate."""
+    kind = classify_error(error_msg)
+    if kind in ('cookie_expired', 'cookie_format', 'auth'):
+        return False
     error_lower = str(error_msg).lower()
     is_geo_restriction = any(
         pattern.lower() in error_lower for pattern in GEO_RESTRICTION_ERRORS
     )
-    matched = is_geo_restriction or any(
+    matched = kind in ('proxy', 'network', 'blocked') or is_geo_restriction or any(
         pattern.lower() in error_lower for pattern in RETRY_ERRORS
     )
     if matched:
@@ -193,10 +199,46 @@ def _apply_cookie(ydl_opts):
     ydl_opts['no_warnings'] = False
     return ydl_opts
 
+@contextmanager
+def cookie_youtube_dl(options):
+    with cookie_snapshot(options.get('cookiefile')) as snapshot:
+        options = dict(options)
+        if snapshot:
+            options['cookiefile'] = snapshot
+        diagnostics = CookieDiagnosticLogger()
+        options['logger'] = diagnostics
+        try:
+            with yt_dlp.YoutubeDL(options) as ydl:
+                yield ydl
+        except Exception as exc:
+            if diagnostics.cookie_warning and classify_error(exc) in ('auth', 'blocked', 'cookie_expired'):
+                raise diagnostic_error(diagnostics.cookie_warning) from exc
+            raise
+
+
+class CookieDiagnosticLogger:
+    """yt-dlp reports revoked YouTube cookies as a warning before failing."""
+
+    def __init__(self):
+        self.cookie_warning = None
+
+    def debug(self, message):
+        logger.debug('%s', message)
+
+    def warning(self, message):
+        if classify_error(message) in ('cookie_expired', 'cookie_format'):
+            self.cookie_warning = message
+        logger.warning('%s', message)
+
+    def error(self, message):
+        logger.error('%s', message)
+
+
 # --- Video Info Extraction ---
 def get_video_info(url):
     """Extract video info without downloading to check file size."""
     proxy_list = get_proxy_list()
+    last_error = None
     
     for proxy in proxy_list:
         ydl_opts = {
@@ -212,7 +254,7 @@ def get_video_info(url):
         _apply_cookie(ydl_opts)
 
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            with cookie_youtube_dl(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
                 filesize = info.get('filesize') or info.get('filesize_approx') or 0
                 
@@ -233,11 +275,12 @@ def get_video_info(url):
                     'is_live': info.get('is_live', False),
                 }
         except Exception as e:
+            last_error = e
             if is_retryable_error(str(e)):
                 continue
-            raise e
+            raise diagnostic_error(e) from e
     
-    raise Exception("Could not extract video info")
+    raise diagnostic_error(last_error or "Could not extract video info")
 
 def get_channel_info(channel_url):
     """Get channel information including ID and name."""
@@ -252,6 +295,7 @@ def get_channel_info(channel_url):
         }
 
     proxy_list = get_proxy_list()
+    last_error = None
     
     for proxy in proxy_list:
         ydl_opts = {
@@ -269,7 +313,7 @@ def get_channel_info(channel_url):
         _apply_cookie(ydl_opts)
 
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            with cookie_youtube_dl(ydl_opts) as ydl:
                 info = ydl.extract_info(channel_url, download=False)
                 return {
                     'channel_id': info.get('channel_id') or info.get('id', ''),
@@ -277,11 +321,12 @@ def get_channel_info(channel_url):
                     'url': info.get('webpage_url', channel_url),
                 }
         except Exception as e:
+            last_error = e
             if is_retryable_error(str(e)):
                 continue
-            raise e
+            raise diagnostic_error(e) from e
     
-    raise Exception("Could not extract channel info")
+    raise diagnostic_error(last_error or "Could not extract channel info")
 
 def get_latest_videos(channel_id, limit=5):
     """Get latest videos from a channel. Merges results across proxies to catch geo-restricted ones."""
@@ -313,7 +358,7 @@ def get_latest_videos(channel_id, limit=5):
         _apply_cookie(ydl_opts)
 
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            with cookie_youtube_dl(ydl_opts) as ydl:
                 info = ydl.extract_info(channel_url, download=False)
                 for entry in info.get('entries', []):
                     if entry and entry.get('id'):
@@ -404,7 +449,7 @@ def download_content(url, progress_callback=None, audio_only=False, audio_format
         _apply_cookie(ydl_opts)
 
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            with cookie_youtube_dl(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
                 filename = ydl.prepare_filename(info)
                 
@@ -464,23 +509,19 @@ def download_content(url, progress_callback=None, audio_only=False, audio_format
             if is_retryable_error(last_error, proxy):
                 # If geo-restricted or bot detected, try next proxy
                 if progress_callback:
-                    progress_callback({'status': 'geo_err', 'msg': f'Blocked by YouTube using proxy {proxy or "Direct"}. Trying next.'})
+                    progress_callback({'status': 'geo_err', 'msg': (error_hint(last_error) or '下載失敗。') + ' 正在嘗試下一個連線。'})
                 continue
             else:
                 logger.error(f"Non-geo error, stopping retry: {last_error}")
-                raise e
+                raise diagnostic_error(e) from e
     
-    if len(proxy_list) == 1 and proxy_list[0] is None:
-        if is_retryable_error(str(last_error)):
-            raise Exception(f"Geo-restricted video. Please configure PROXY or PROXY_LIST in .env")
-        raise Exception(f"Download failed: {last_error}")
-    else:
-        raise Exception(f"All {len(proxy_list)} proxies failed. Last error: {last_error}")
+    raise diagnostic_error(last_error or 'Download failed without a result')
 
 # --- Playlist Info ---
 def get_playlist_info(url):
     """Get playlist information without downloading."""
     proxy_list = get_proxy_list()
+    last_error = None
     
     for proxy in proxy_list:
         ydl_opts = {
@@ -497,7 +538,7 @@ def get_playlist_info(url):
         _apply_cookie(ydl_opts)
 
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            with cookie_youtube_dl(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
                 entries = info.get('entries', [])
                 return {
@@ -508,11 +549,12 @@ def get_playlist_info(url):
                     'entries': [{'url': e.get('url') or f"https://www.youtube.com/watch?v={e.get('id')}", 'title': e.get('title', 'Unknown')} for e in entries if e]
                 }
         except Exception as e:
+            last_error = e
             if is_retryable_error(str(e), proxy):
                 continue
-            raise e
+            raise diagnostic_error(e) from e
     
-    raise Exception("Could not extract playlist info")
+    raise diagnostic_error(last_error or "Could not extract playlist info")
 
 def is_playlist(url):
     """Check if URL is a playlist or a single video."""
@@ -529,7 +571,7 @@ def is_playlist(url):
         _apply_cookie(ydl_opts)
 
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            with cookie_youtube_dl(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
                 # Check if it has entries (playlist)
                 # ie_key is usually present for nested items, we want the top level to be a playlist
@@ -566,7 +608,7 @@ def get_live_info(channel_id):
             ydl_opts['proxy'] = proxy
         _apply_cookie(ydl_opts)
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            with cookie_youtube_dl(ydl_opts) as ydl:
                 info = ydl.extract_info(live_url, download=False)
                 if info.get('is_live'):
                     return LiveProbeResult('LIVE', {
@@ -601,7 +643,7 @@ def get_stream_url(url):
             ydl_opts['proxy'] = proxy
         _apply_cookie(ydl_opts)
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            with cookie_youtube_dl(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
                 return info.get('url'), proxy
         except:

@@ -345,6 +345,21 @@ WARP_PASSWORD=warppass
 
 遇到明確的地區限制（geo block）時，Bot 只會換下一個 proxy，不會重建 WARP IP。bot 偵測、403、timeout 等其他可重試錯誤，在正在使用 `warp-proxy` 時才可能要求 WARP rotation。
 
+### 透過 Telegram 更新 cookies
+
+1. 在 `.env` 設定 `COOKIE_ADMIN_IDS=你的Telegram使用者ID`，多位管理者以逗號分隔。空白或格式錯誤會停用上傳；這與下載用的 `ALLOWED_CHAT_IDS` 分開。
+2. 套用設定並重建／重建容器後，用該帳號**私訊 bot**，直接傳送 `cookie.txt` 或 `cookies.txt` 檔案。
+3. 檔案須為 Netscape 格式、非空且不超過 1 MiB。格式錯誤或全部已到期時，保留原有檔案。
+4. 成功後存到 `data/cookies.txt`（權限 600），後續下載自動載入，更新 cookies 不需重啟。進行中的下載使用自己的副本。
+
+這是全 bot 共用的登入憑證，因此只允許明確指定的管理者在私訊中更新，不接受群組上傳。不要把 cookies 傳給其他人或提交到 Git。
+
+上傳成功只代表格式與到期時間通過檢查，**不保證登入有效**：網站可能提前撤銷 cookies，或帳號沒有私人／年齡限制影片的權限。傳送目標影片網址即可實測。
+
+錯誤訊息會區分網站明確回報 cookies 失效、登入／權限不足、地區限制、proxy 驗證與網路連線問題。明確的 cookies／登入問題不會觸發 WARP 重啟；機器人驗證、403、429 仍可嘗試其他出口，但會標示 cookies、IP 或限流皆有可能，不再統稱「所有 proxy 故障」。
+
+使用 Local Bot API 時，`API_URL` 也會用於檔案下載。Compose 已將 Bot API 檔案目錄唯讀掛載給 bot，支援 `getFile` 回傳本機絕對路徑；外部 Local API 若啟用 local 模式，也需要在 bot 容器提供相同路徑。
+
 ### YouTube Cookie：遇到 403、bot 偵測時再加
 
 1. 將瀏覽器中已登入 YouTube 的 Cookie 匯出成 **Netscape cookies.txt** 格式。
@@ -489,7 +504,7 @@ docker-compose logs --tail=100 telegram-bot-api
 /upgrade
 ```
 
-仍然失敗時，再放入 `data/cookies.txt`，然後重啟容器。Cookie 必須是 Netscape 格式。
+仍然失敗時，可由管理者私訊上傳 `cookie.txt`，或更新 `data/cookies.txt`；後續下載自動載入，不需重啟。Cookie 必須是 Netscape 格式。
 
 ### Geo block／這個地區不能看
 

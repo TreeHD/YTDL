@@ -22,7 +22,7 @@ from handlers import (
     handle_unsubscribe, handle_subscriptions, cancel_callback, audio_callback,
     handle_settings, settings_callback, stop_live_callback, fromstart_callback,
     retry_upload_callback,
-    handle_upgrade
+    handle_upgrade, handle_cookie_document
 )
 from queue_processor import (
     process_queue, process_playlist_queue, has_active_downloads,
@@ -70,6 +70,8 @@ def main():
 
     if api_url:
         builder.base_url(api_url)
+        # Files must be fetched from the same Bot API server as getFile.
+        builder.base_file_url(api_url.rstrip('/').removesuffix('/bot') + '/file/bot')
         print(f"Using API Server: {api_url}")
         
     application = builder.build()
@@ -119,6 +121,8 @@ def main():
     application.add_handler(CommandHandler('subs', handle_subscriptions))  # Alias
     application.add_handler(CommandHandler('settings', handle_settings))
     
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_cookie_document))
+
     # Message handler for direct URLs
     application.add_handler(MessageHandler(
         filters.TEXT & (~filters.COMMAND), 
