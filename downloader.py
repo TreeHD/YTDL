@@ -5,6 +5,7 @@ Handles yt-dlp downloads with proxy rotation.
 
 import os
 import logging
+import re
 import yt_dlp
 from dataclasses import dataclass, field
 from contextlib import contextmanager
@@ -207,6 +208,8 @@ def cookie_youtube_dl(options):
             options['cookiefile'] = snapshot
         diagnostics = CookieDiagnosticLogger()
         options['logger'] = diagnostics
+        # yt-dlp only emits the full FFmpeg stderr when verbose is enabled.
+        options['verbose'] = True
         try:
             with yt_dlp.YoutubeDL(options) as ydl:
                 yield ydl
@@ -223,7 +226,14 @@ class CookieDiagnosticLogger:
         self.cookie_warning = None
 
     def debug(self, message):
-        logger.debug('%s', message)
+        # yt-dlp sends captured FFmpeg stderr here only after a failed process.
+        # Do not expose verbose startup configuration or command-line secrets.
+        detail = str(message).removeprefix('[debug] ')
+        if detail.startswith(('ffmpeg version ', 'avconv version ')) or 'Conversion failed!' in detail:
+            detail = re.sub(r"(?i)\b(?:https?|socks5h?|rtmps?)://[^\s]+", '<redacted-url>', detail)
+            logger.error('FFmpeg failure details (last 8000 characters):\n%s', detail[-8000:])
+        elif not str(message).startswith('[debug] '):
+            logger.debug('%s', message)
 
     def warning(self, message):
         if classify_error(message) in ('cookie_expired', 'cookie_format'):
