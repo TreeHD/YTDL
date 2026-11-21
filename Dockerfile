@@ -28,6 +28,7 @@ COPY downloader.py .
 COPY uploader.py .
 COPY handlers.py .
 COPY queue_processor.py .
+COPY live_archive.py .
 COPY subscription.py .
 COPY telegram_utils.py .
 COPY upgrader.py .
