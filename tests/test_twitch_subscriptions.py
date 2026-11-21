@@ -5,25 +5,14 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from yt_dlp.extractor.twitch import TwitchStreamIE
+from yt_dlp.utils import ExtractorError, UserNotLive
+
 from downloader import (
     get_channel_info, get_latest_videos, get_live_info,
     is_legacy_numeric_channel_id, is_twitch_channel_id,
 )
 from subscription import SubscriptionMonitor
-
-
-class OfflineTwitchYDL:
-    def __init__(self, _options):
-        pass
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_args):
-        return False
-
-    def extract_info(self, _url, download=False):
-        raise Exception('ERROR: [twitch:stream] kspksp: The channel is not currently live')
 
 
 class TestTwitchSubscriptions(unittest.TestCase):
@@ -41,10 +30,18 @@ class TestTwitchSubscriptions(unittest.TestCase):
 
     def test_offline_channel_is_not_a_subscription_error(self):
         with patch('downloader.get_proxy_list', return_value=[None]), \
-             patch('downloader.yt_dlp.YoutubeDL', OfflineTwitchYDL):
+             patch.object(TwitchStreamIE, '_real_extract', side_effect=UserNotLive(video_id='kspksp')), \
+             self.assertNoLogs('downloader', level='WARNING'):
             result = get_live_info('twitch:kspksp')
-
         self.assertEqual(result.state, 'ENDED')
+
+    def test_twitch_probe_failure_remains_visible(self):
+        with patch('downloader.get_proxy_list', return_value=[None]), \
+             patch.object(TwitchStreamIE, '_real_extract', side_effect=ExtractorError('proxy timed out')), \
+             self.assertLogs('downloader', level='ERROR') as logs:
+            result = get_live_info('twitch:kspksp')
+        self.assertEqual(result.state, 'UNKNOWN')
+        self.assertTrue(any('proxy timed out' in entry for entry in logs.output))
 
     def test_numeric_legacy_id_is_never_queried_as_youtube(self):
         self.assertTrue(is_legacy_numeric_channel_id('315460461806'))

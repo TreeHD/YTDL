@@ -6,7 +6,9 @@ Handles yt-dlp downloads with proxy rotation.
 import os
 import logging
 import re
+import sys
 import yt_dlp
+from yt_dlp.utils import UserNotLive
 from dataclasses import dataclass, field
 from contextlib import contextmanager
 from cookie_manager import cookie_snapshot
@@ -100,7 +102,7 @@ def probe_live_state(url, expected_video_id=None):
             ydl_opts['proxy'] = proxy
         _apply_cookie(ydl_opts)
         try:
-            with cookie_youtube_dl(ydl_opts) as ydl:
+            with cookie_youtube_dl(ydl_opts, twitch_live_probe=is_twitch_url(url)) as ydl:
                 info = ydl.extract_info(url, download=False)
             video_id = info.get('id', '')
             if expected_video_id and video_id != expected_video_id:
@@ -201,12 +203,12 @@ def _apply_cookie(ydl_opts):
     return ydl_opts
 
 @contextmanager
-def cookie_youtube_dl(options):
+def cookie_youtube_dl(options, *, twitch_live_probe=False):
     with cookie_snapshot(options.get('cookiefile')) as snapshot:
         options = dict(options)
         if snapshot:
             options['cookiefile'] = snapshot
-        diagnostics = CookieDiagnosticLogger()
+        diagnostics = CookieDiagnosticLogger(twitch_live_probe=twitch_live_probe)
         options['logger'] = diagnostics
         # yt-dlp only emits the full FFmpeg stderr when verbose is enabled.
         options['verbose'] = True
@@ -222,8 +224,9 @@ def cookie_youtube_dl(options):
 class CookieDiagnosticLogger:
     """yt-dlp reports revoked YouTube cookies as a warning before failing."""
 
-    def __init__(self):
+    def __init__(self, *, twitch_live_probe=False):
         self.cookie_warning = None
+        self.twitch_live_probe = twitch_live_probe
 
     def debug(self, message):
         # yt-dlp sends captured FFmpeg stderr here only after a failed process.
@@ -241,6 +244,10 @@ class CookieDiagnosticLogger:
         logger.warning('%s', message)
 
     def error(self, message):
+        # yt-dlp emits both the message and its verbose traceback while handling
+        # UserNotLive, before extract_info raises the wrapped DownloadError.
+        if self.twitch_live_probe and isinstance(sys.exc_info()[1], UserNotLive):
+            return
         logger.error('%s', message)
 
 
@@ -619,7 +626,7 @@ def get_live_info(channel_id):
             ydl_opts['proxy'] = proxy
         _apply_cookie(ydl_opts)
         try:
-            with cookie_youtube_dl(ydl_opts) as ydl:
+            with cookie_youtube_dl(ydl_opts, twitch_live_probe=is_twitch) as ydl:
                 info = ydl.extract_info(live_url, download=False)
                 if info.get('is_live'):
                     return LiveProbeResult('LIVE', {
