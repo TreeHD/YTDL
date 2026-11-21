@@ -3,9 +3,11 @@ import os
 import tempfile
 import unittest
 from contextlib import ExitStack
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from live_archive import MediaInfo, closed_chunks
 import queue_processor as qp
 
 
@@ -34,44 +36,63 @@ class TestLiveRecording(unittest.IsolatedAsyncioTestCase):
         retired = asyncio.Event()
         archive_upload_started = asyncio.Event()
         resumed = asyncio.Event()
-        reads = 0
         ticks = 0
-        archive_scenario = scenario in ('archive_eof', 'archive_stall')
+        archive_scenario = scenario in ('archive_eof', 'archive_stall', 'proxy_retry', 'missing_audio', 'resume', 'mismatch', 'bad_mp4')
+        attempts = []
+        check_replay = scenario in ('public_replay', 'no_replay')
+        replay_ids = []
 
-        async def archive_read(size):
-            nonlocal reads
+        async def replay(video_id, proxies, cookies, target, stopping, *coverage):
+            replay_ids.append(video_id)
+            if scenario == 'public_replay':
+                Path(target).write_bytes(b'v' * 2048)
+                return MediaInfo(60, 1920, 1080, 'aac', 2000000)
+
+        async def record(url, proxy, cookies, prefix, accept, stopping, cancelled):
+            attempts.append(proxy)
+            if scenario == 'proxy_retry' and len(attempts) == 1:
+                raise ValueError('no media from proxy')
             if not archive_scenario:
-                return b''
-            reads += 1
-            if reads <= 2:
-                return b'x' * 2048
+                raise ValueError('no DVR')
+            path = Path(prefix + '.mkv')
+            path.write_bytes(b'x' * 2048)
+            await accept(str(path))
+            if scenario in ('resume', 'mismatch'):
+                if len(attempts) == 1:
+                    raise ValueError('proxy disconnected')
+                next_path = Path(prefix + '_next.mkv')
+                next_path.write_bytes(b'y' * 2048)
+                await accept(str(next_path))
             await retired.wait()
             if scenario == 'archive_stall':
-                if reads == 3:
-                    raise asyncio.TimeoutError
-                await resumed.wait()
-            archive.returncode = 0
-            return b''
+                raise ValueError('DVR stopped producing segments')
 
-        archive = FakeProcess(
-            returncode=None if archive_scenario else 1,
-            stdout=SimpleNamespace(read=archive_read),
-        )
+        def probe(path, *, chunk=False):
+            if scenario == 'missing_audio' and chunk:
+                raise ValueError('missing audio packets')
+            if scenario == 'bad_mp4' and not chunk and 'fromstart' in str(path):
+                raise ValueError('final MP4 has no audio')
+            boundary = ('changed' if scenario == 'mismatch' and len(attempts) > 1 else 'same',)
+            return MediaInfo(60, 1920, 1080, 'aac', 2000000, boundary)
 
         async def status(text, **kwargs):
             statuses.append(text)
+            if check_replay and 'Recording live stream' in text:
+                recorders[0].returncode = 1
             if 'Live-edge backup stopped' in text:
                 retired.set()
+            if 'missing audio packets' in text or 'timelines differ' in text:
+                qp.stopped_tasks.add(task_id)
             if 'Part 3)' in text:
                 qp.stopped_tasks.add(task_id)
 
         async def sleep(delay):
             nonlocal ticks
             ticks += 1
-            if ticks > 200:
+            if ticks > 10000:
                 qp.cancelled_tasks.add(task_id)
                 resumed.set()
-            await real_sleep(0)
+            await real_sleep(0.001)
 
         async def upload(*args, **kwargs):
             uploads.append(args[3])
@@ -81,49 +102,21 @@ class TestLiveRecording(unittest.IsolatedAsyncioTestCase):
             return True
 
         with tempfile.TemporaryDirectory() as directory:
-            class FakeStdin:
-                def __init__(self, segment_path, list_path):
-                    self.segment_path = segment_path
-                    self.list_path = list_path
-                    self.written = 0
-                    self.closed = False
-
-                def write(self, data):
-                    self.written += len(data)
-                    if self.written >= 1024 and not os.path.exists(self.segment_path):
-                        with open(self.segment_path, 'wb') as output:
-                            output.write(b'x' * 2048)
-                        with open(self.list_path, 'w') as listing:
-                            listing.write(f'{os.path.basename(self.segment_path)},0,60\n')
-
-                async def drain(self):
-                    return None
-
-                def is_closing(self):
-                    return self.closed
-
-                def close(self):
-                    self.closed = True
-
-                async def wait_closed(self):
-                    return None
-
             async def spawn(*cmd, **kwargs):
-                if cmd[0] == 'yt-dlp':
-                    return archive
-                if cmd[0] == 'ffmpeg' and '-segment_list' in cmd:
-                    pattern = cmd[-1]
-                    segment_path = pattern.replace('%06d', '000001')
-                    list_path = cmd[cmd.index('-segment_list') + 1]
-                    return FakeProcess(
-                        returncode=0,
-                        stdin=FakeStdin(segment_path, list_path),
-                    )
+                if scenario == 'resume' and '-f' in cmd and 'concat' in cmd:
+                    manifest = Path(cmd[cmd.index('-i') + 1]).read_text()
+                    self.assertEqual(manifest.count('file '), 2)
+                    self.assertIn('_1.mkv', manifest)
+                    self.assertNotIn('_2.mkv', manifest)
                 if cmd[0] == 'streamlink':
                     proc = FakeProcess()
                     recorders.append(proc)
                     path = cmd[cmd.index('-o') + 1]
-                    if archive_scenario:
+                    if check_replay:
+                        size = 2048 if len(recorders) == 1 else 0
+                        if not size:
+                            proc.returncode = 1
+                    elif archive_scenario:
                         size = 2048
                         if len(recorders) == 2:
                             # Recovery must occur while the archive upload is pending.
@@ -150,8 +143,11 @@ class TestLiveRecording(unittest.IsolatedAsyncioTestCase):
                 for name, value in {
                     'DOWNLOAD_DIR': directory,
                     'LIVE_FROM_START_STABILITY_SECONDS': 0,
-                    'LIVE_FROM_START_MAX_DATA_GAP_SECONDS': -1 if scenario == 'archive_stall' else 30,
-                    'get_proxy_list': lambda: [None],
+                    'record_dvr': record,
+                    'probe_media': probe,
+                    'fetch_replay': replay,
+                    'probe_live_state': lambda *args: SimpleNamespace(state='ENDED', errors=[]),
+                    'get_proxy_list': lambda: ['first', 'second'] if scenario in ('proxy_retry', 'resume', 'mismatch') else [None],
                     'get_cookie_file': lambda: None,
                     'get_ffmpeg_command': lambda: 'ffmpeg',
                     'handle_upload': upload,
@@ -163,15 +159,18 @@ class TestLiveRecording(unittest.IsolatedAsyncioTestCase):
                 message = SimpleNamespace(text='', edit_text=status, delete=AsyncMock())
                 try:
                     await asyncio.wait_for(qp.process_live_stream(
-                        SimpleNamespace(bot=SimpleNamespace()), 1, 'https://example.test/live',
-                        2, message, task_id, status, 'Channel',
+                        SimpleNamespace(bot=SimpleNamespace()), 1, 'https://www.youtube.com/watch?v=sample',
+                        2, message, task_id, status, 'Channel', expected_live_video_id='sample',
                     ), timeout=5)
                 finally:
                     qp.stopped_tasks.discard(task_id)
                     qp.cancelled_tasks.discard(task_id)
 
-        self.assertLess(ticks, 200, statuses)
+        self.assertLess(ticks, 10000, statuses)
         self.assertFalse(any('Live recording error' in text for text in statuses), statuses)
+        self.assertEqual(replay_ids, ['sample'] if check_replay else [])
+        if scenario == 'proxy_retry':
+            self.assertEqual(attempts, ['first', 'second'])
         return recorders, statuses, uploads, resumed.is_set()
 
     async def test_no_vod_continues_across_two_size_rollovers(self):
@@ -200,15 +199,40 @@ class TestLiveRecording(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(recorders), 2)
         self.assertTrue(any('Live-edge backup stopped' in text for text in statuses))
 
-    def test_archive_segmenter_outputs_container_aware_closed_chunks(self):
-        command = qp._build_archive_segment_command(
-            'ffmpeg', '/tmp/live_chunk_%06d.ts', '/tmp/live_segments.csv'
-        )
-        self.assertIn('pipe:0', command)
-        self.assertIn('segment', command)
-        self.assertIn('mpegts', command)
-        self.assertIn('copy', command)
-        self.assertEqual(command[command.index('-segment_time') + 1], '60')
+    async def test_proxy_with_no_media_rotates_before_handoff(self):
+        _, statuses, uploads, _ = await self.run_recording('proxy_retry')
+        self.assertTrue(any('Live-edge backup stopped' in text for text in statuses))
+        self.assertTrue(any('From Start' in title for title in uploads))
+
+    async def test_unverified_archive_keeps_edge_and_skips_archive_upload(self):
+        _, statuses, uploads, _ = await self.run_recording('missing_audio')
+        self.assertFalse(any('Live-edge backup stopped' in text for text in statuses))
+        self.assertFalse(any('From Start' in title for title in uploads))
+        self.assertTrue(any('LIVE Part' in title for title in uploads))
+
+    async def test_resume_deduplicates_verified_overlap(self):
+        _, _, uploads, _ = await self.run_recording('resume')
+        self.assertTrue(any('From Start' in title for title in uploads))
+
+    async def test_mismatched_checkpoint_keeps_edge(self):
+        _, statuses, uploads, _ = await self.run_recording('mismatch')
+        self.assertTrue(any('timelines differ' in text for text in statuses))
+        self.assertTrue(any('LIVE Part' in title for title in uploads))
+
+    async def test_final_verification_failure_recovers_retired_backup(self):
+        _, statuses, uploads, _ = await self.run_recording('bad_mp4')
+        self.assertTrue(any('backup stopped and retained' in text for text in statuses))
+        self.assertFalse(any('From Start' in title for title in uploads))
+        self.assertEqual(sum('LIVE Part' in title for title in uploads), 2)
+
+    async def test_public_replay_replaces_remaining_edge_after_confirmed_end(self):
+        _, _, uploads, _ = await self.run_recording('public_replay')
+        self.assertEqual(uploads, ['Channel - Full replay'])
+
+    async def test_no_replay_delivers_recorded_edge(self):
+        _, _, uploads, _ = await self.run_recording('no_replay')
+        self.assertEqual(len(uploads), 1)
+        self.assertIn('LIVE Part', uploads[0])
 
     def test_only_closed_segments_from_ffmpeg_manifest_are_consumed(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -219,7 +243,7 @@ class TestLiveRecording(unittest.IsolatedAsyncioTestCase):
             with open(listing, 'w') as output:
                 output.write('chunk_000001.ts,0,60\n')
                 output.write('chunk_000002.ts,60')  # ffmpeg is still writing it
-            self.assertEqual(qp._read_completed_archive_chunks(listing, directory), [first])
+            self.assertEqual(closed_chunks(listing), [first])
 
 
 if __name__ == '__main__':
