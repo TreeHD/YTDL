@@ -47,6 +47,12 @@ logger = logging.getLogger(__name__)
 # both recorders would only create duplicate uploads.
 LIVE_FROM_START_STABILITY_SECONDS = 10 * 60
 
+# Remuxing the archive's MKV chunks into MP4 adds a little container overhead.
+# Batches sized right at the 1900MiB upload target came out a few MB over it,
+# so split_video re-copied the whole 1.9GB file only to produce one identical
+# part. Leave headroom so a batch always fits as a single upload.
+ARCHIVE_BATCH_BYTES = 1850 * 1024 * 1024
+
 # Upload retries are deliberately separate from the download queue.  A Telegram
 # flood-control delay must never keep every later download waiting behind it.
 UPLOAD_RETRY_WINDOW_SECONDS = 24 * 60 * 60
@@ -760,7 +766,11 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
     async def _download_from_start():
         nonlocal archive_info, archive_delivered, archive_finished_cleanly, dvr_proxy
         bg_id = f"{task_id}_fromstart"
-        segment_queue = asyncio.Queue(maxsize=3)
+        # Unbounded on purpose: FFmpeg keeps writing chunks to disk regardless,
+        # the queue only holds their paths. A bound would stop verification
+        # while a 1.9GB batch uploads, and the stale verification time would
+        # then be mistaken for a stalled archive, restarting the live edge.
+        segment_queue = asyncio.Queue()
         failed_paths = set()
         verified_count = 0
         first_verified = None
@@ -901,7 +911,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                     fromstart_failed.set()
                     fromstart_stable.clear()
                     continue
-                if batch_paths and batch_bytes + chunk_size > SEGMENT_SIZE_BYTES:
+                if batch_paths and batch_bytes + chunk_size > ARCHIVE_BATCH_BYTES:
                     batch_num += 1
                     if not await _remux_and_upload_batch(batch_paths, batch_num):
                         delivered_batches = False

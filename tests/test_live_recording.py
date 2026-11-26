@@ -38,7 +38,8 @@ class TestLiveRecording(unittest.IsolatedAsyncioTestCase):
         archive_upload_started = asyncio.Event()
         resumed = asyncio.Event()
         ticks = 0
-        archive_scenario = scenario in ('archive_eof', 'archive_stall', 'proxy_retry', 'missing_audio', 'resume', 'mismatch', 'bad_mp4')
+        archive_scenario = scenario in ('archive_eof', 'archive_stall', 'proxy_retry', 'missing_audio', 'resume', 'mismatch', 'bad_mp4', 'busy_upload')
+        all_chunks_verified = asyncio.Event()
         attempts = []
         check_replay = scenario in ('public_replay', 'no_replay')
         reconnect = scenario == 'reconnect'
@@ -61,6 +62,14 @@ class TestLiveRecording(unittest.IsolatedAsyncioTestCase):
             path = Path(prefix + '.mkv')
             path.write_bytes(b'x' * 2048)
             await accept(str(path))
+            if scenario == 'busy_upload':
+                # Every chunk closes a batch, so batch 1 is uploading while
+                # the DVR keeps producing; verification must not wait for it.
+                for index in range(2, 8):
+                    chunk = Path(f'{prefix}_{index}.mkv')
+                    chunk.write_bytes(b'x' * 2048)
+                    await accept(str(chunk))
+                all_chunks_verified.set()
             if scenario in ('resume', 'mismatch'):
                 if len(attempts) == 1:
                     raise ValueError('proxy disconnected')
@@ -104,6 +113,8 @@ class TestLiveRecording(unittest.IsolatedAsyncioTestCase):
             if scenario == 'archive_eof' and 'From Start' in args[3]:
                 archive_upload_started.set()
                 await resumed.wait()
+            if scenario == 'busy_upload' and 'From Start Part 1' in args[3]:
+                await asyncio.wait_for(all_chunks_verified.wait(), 2)
             return True
 
         with tempfile.TemporaryDirectory() as directory:
@@ -161,6 +172,7 @@ class TestLiveRecording(unittest.IsolatedAsyncioTestCase):
                 for name, value in {
                     'DOWNLOAD_DIR': directory,
                     'LIVE_FROM_START_STABILITY_SECONDS': 0,
+                    'ARCHIVE_BATCH_BYTES': 1 if scenario == 'busy_upload' else qp.ARCHIVE_BATCH_BYTES,
                     'record_dvr': record,
                     'probe_media': probe,
                     'fetch_replay': replay,
@@ -251,6 +263,11 @@ class TestLiveRecording(unittest.IsolatedAsyncioTestCase):
         _, _, uploads, _ = await self.run_recording('no_replay')
         self.assertEqual(len(uploads), 1)
         self.assertIn('LIVE Part', uploads[0])
+
+    async def test_archive_keeps_verifying_while_a_batch_uploads(self):
+        _, statuses, uploads, _ = await self.run_recording('busy_upload')
+        self.assertFalse(any('From-start segment' in text for text in statuses), statuses)
+        self.assertEqual(sum('From Start' in title for title in uploads), 7)
 
     async def test_reconnected_segment_is_remuxed_from_parts_without_copying(self):
         _, _, uploads, _ = await self.run_recording('reconnect')
