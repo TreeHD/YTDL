@@ -69,6 +69,23 @@ class TestDownloaderUtils(unittest.TestCase):
         ))
         restart_warp_proxy.assert_called_once()
 
+    @patch('downloader.restart_warp_proxy')
+    def test_active_live_recording_blocks_warp_rotation(self, restart_warp_proxy):
+        # A channel poll or ordinary download must not cut live recordings off.
+        with patch('downloader.active_live_tasks', {'live-task'}):
+            self.assertTrue(is_retryable_error(
+                "Sign in to confirm you're not a bot",
+                "http://warp-proxy:8080",
+            ))
+        restart_warp_proxy.assert_not_called()
+
+    @patch('downloader.restart_warp_proxy')
+    def test_unavailable_content_tries_next_proxy_without_rotating_warp(self, restart_warp_proxy):
+        for error in ("Private video. Sign in if you've been granted access to this video",
+                      "This video has been removed by the uploader"):
+            self.assertTrue(is_retryable_error(error, "http://warp-proxy:8080"))
+        restart_warp_proxy.assert_not_called()
+
     @patch('downloader.yt_dlp.YoutubeDL')
     def test_live_probe_requires_the_expected_video_id(self, youtube_dl):
         ydl = youtube_dl.return_value.__enter__.return_value

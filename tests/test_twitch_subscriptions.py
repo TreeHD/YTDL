@@ -10,7 +10,7 @@ from yt_dlp.utils import ExtractorError, UserNotLive
 
 from downloader import (
     get_channel_info, get_latest_videos, get_live_info,
-    is_legacy_numeric_channel_id, is_twitch_channel_id,
+    is_legacy_numeric_channel_id, is_twitch_channel_id, probe_live_state,
 )
 from subscription import SubscriptionMonitor
 
@@ -42,6 +42,21 @@ class TestTwitchSubscriptions(unittest.TestCase):
             result = get_live_info('twitch:kspksp')
         self.assertEqual(result.state, 'UNKNOWN')
         self.assertTrue(any('proxy timed out' in entry for entry in logs.output))
+
+    def test_recorder_probe_confirms_end_when_twitch_channel_goes_offline(self):
+        # Without this, every Twitch recording waited out the whole recovery
+        # window and was reported as a proxy interruption.
+        with patch('downloader.get_proxy_list', return_value=[None, 'http://second:8080']), \
+             patch.object(TwitchStreamIE, '_real_extract', side_effect=UserNotLive(video_id='kspksp')) as extract:
+            result = probe_live_state('https://www.twitch.tv/kspksp', '123456')
+        self.assertEqual(result.state, 'ENDED')
+        self.assertEqual(extract.call_count, 1)
+
+    def test_recorder_probe_twitch_transport_failure_stays_unknown(self):
+        with patch('downloader.get_proxy_list', return_value=[None]), \
+             patch.object(TwitchStreamIE, '_real_extract', side_effect=ExtractorError('proxy timed out')):
+            result = probe_live_state('https://www.twitch.tv/kspksp', '123456')
+        self.assertEqual(result.state, 'UNKNOWN')
 
     def test_numeric_legacy_id_is_never_queried_as_youtube(self):
         self.assertTrue(is_legacy_numeric_channel_id('315460461806'))

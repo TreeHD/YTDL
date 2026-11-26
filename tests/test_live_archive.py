@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from live_archive import fetch_replay, probe_media, record_dvr
+from live_archive import closed_chunks, fetch_replay, probe_media, record_dvr
 
 
 @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'), 'FFmpeg tools required')
@@ -32,9 +32,18 @@ from pathlib import Path
 work = Path(__file__).parent
 args = sys.argv[1:]
 if '--live-from-start' in args:
-    source = 'audio.mka' if args[args.index('-f') + 1] == 'ba/b' else 'video.mkv'
+    audio = args[args.index('-f') + 1] == 'ba/b'
+    source = 'audio.mka' if audio else 'video.mkv'
     with (work / source).open('rb') as media:
         shutil.copyfileobj(media, sys.stdout.buffer)
+    sys.stdout.flush()
+    if os.getenv('DVR_SOURCE_FAILS'):
+        # Keep the pipes open so the final segment is still open when the
+        # video source dies, exactly like a proxy dropping mid-segment.
+        import time
+        time.sleep(60 if audio else 2)
+        if not audio:
+            sys.exit(1)
 else:
     output = Path(args[args.index('-o') + 1].replace('%(ext)s', 'mp4'))
     shutil.copy(work / 'complete.mp4', output)
@@ -55,6 +64,22 @@ else:
                                               accept, lambda: False, lambda: False), 15)
         self.assertGreaterEqual(len(verified), 2)
         self.assertTrue(all(m.width == 96 and m.audio == 'aac' and m.bitrate > 0 for m in verified))
+
+    async def test_failed_source_does_not_accept_truncated_final_segment(self):
+        accepted = []
+
+        async def accept(path):
+            accepted.append(path)
+
+        prefix = str(self.work / 'part')
+        with patch('live_archive.CHUNK_SECONDS', 2), patch.dict(os.environ, DVR_SOURCE_FAILS='1'):
+            with self.assertRaises(ValueError):
+                await asyncio.wait_for(record_dvr('local', None, None, prefix,
+                                                  accept, lambda: False, lambda: False), 30)
+        listed = closed_chunks(prefix + '.csv')
+        self.assertGreaterEqual(len(accepted), 1)
+        self.assertLess(len(accepted), len(listed))
+        self.assertNotIn(listed[-1], accepted)
 
     def test_video_only_and_short_audio_fail_verification(self):
         with self.assertRaisesRegex(ValueError, 'missing audio'):

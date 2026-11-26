@@ -21,7 +21,7 @@ from live_archive import (
 from download_errors import classify_error, error_hint
 from config import load_config, check_disk_space, check_ffmpeg, DOWNLOAD_DIR, get_ffmpeg_command, get_proxy_list, get_cookie_file
 from downloader import (
-    download_content, get_video_info, get_playlist_info,
+    active_live_tasks, download_content, get_video_info, get_playlist_info,
     probe_live_state, restart_warp_proxy, is_twitch_url,
 )
 from uploader import (
@@ -34,13 +34,13 @@ from uploader import (
     UploadPermanentError,
 )
 from handlers import cancelled_tasks, stopped_tasks
-from telegram_utils import tg_retry, StatusMessageEditor
+from telegram_utils import tg_retry, BackgroundStatusPublisher, StatusMessageEditor
 
 logger = logging.getLogger(__name__)
 
-# Live recordings run outside the request queue processor and need explicit
-# tracking so maintenance never starts while they are active.
-active_live_tasks = set()
+# Live recordings run outside the request queue processor and are tracked in
+# downloader.active_live_tasks, so maintenance never starts while they are
+# active and ordinary downloads never rotate WARP underneath them.
 
 # The live-edge recorder is only a temporary safety net while the archive from
 # the beginning proves it can keep recording.  After this interval, keeping
@@ -408,14 +408,25 @@ def has_active_downloads(request_queue, playlist_queue):
     return bool(request_active or playlist_active or retry_upload_active or active_live_tasks)
 
 
-async def process_live_stream_tracked(*args):
-    """Track a detached live recording for daily maintenance decisions."""
+async def process_live_stream_tracked(*args, on_finished=None):
+    """Track a detached live recording for maintenance and WARP decisions.
+
+    ``on_finished`` receives how the recording ended: ``confirmed_end``,
+    ``stopped``, ``cancelled``, ``proxy_exhausted`` or ``error``. Only the
+    first three mean the broadcast must not be recorded again.
+    """
     task_id = args[5]
     active_live_tasks.add(task_id)
+    outcome = 'error'
     try:
-        await process_live_stream(*args)
+        outcome = await process_live_stream(*args) or 'error'
     finally:
         active_live_tasks.discard(task_id)
+        if on_finished:
+            try:
+                on_finished(outcome)
+            except Exception:
+                logger.exception("[LIVE:%s] Live completion callback failed", task_id)
 
 def _free_memory():
     """Force garbage collection and release memory back to OS via glibc malloc_trim."""
@@ -497,7 +508,11 @@ async def process_queue(application, request_queue):
             is_live = False
             channel_name = None
             expected_live_video_id = None
-            if len(task) == 8:
+            on_live_finished = None
+            if len(task) == 9:
+                (chat_id, url, message_id, max_height, status_msg_passed, channel_name,
+                 is_live, expected_live_video_id, on_live_finished) = task
+            elif len(task) == 8:
                 chat_id, url, message_id, max_height, status_msg_passed, channel_name, is_live, expected_live_video_id = task
             elif len(task) == 7:
                 chat_id, url, message_id, max_height, status_msg_passed, channel_name, is_live = task
@@ -548,7 +563,10 @@ async def process_queue(application, request_queue):
 
             # Initial Live Detection (from queue flag)
             if is_live:
-                asyncio.create_task(process_live_stream_tracked(application, chat_id, url, message_id, status_msg, task_id, update_status_msg, channel_name, expected_live_video_id))
+                asyncio.create_task(process_live_stream_tracked(
+                    application, chat_id, url, message_id, status_msg, task_id, update_status_msg,
+                    channel_name, expected_live_video_id, on_finished=on_live_finished,
+                ))
                 continue
                 
             await update_status_msg(f"🚀 Processing: {url}", force=True, show_cancel=True)
@@ -697,7 +715,10 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
             )])
         return InlineKeyboardMarkup(rows)
 
-    live_status_editor = StatusMessageEditor()
+    # Status edits are delivered in the background. Awaiting Telegram here
+    # would freeze the recording loop (Stop, Cancel, rollover, archive
+    # handoff) for the whole duration of a flood-control wait.
+    live_status_publisher = BackgroundStatusPublisher()
 
     async def live_status(text, force=False, retry_job_id=None):
         nonlocal status_msg
@@ -713,7 +734,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
             keyboard = _make_keyboard(retry_job_id)
             logger.info(f"[LIVE:{task_id}] live_status: '{text}'")
             if status_msg:
-                await live_status_editor.edit(status_msg, text, reply_markup=keyboard)
+                live_status_publisher.publish(status_msg, text, reply_markup=keyboard)
             else:
                 status_msg = await tg_retry(
                     application.bot.send_message,
@@ -965,47 +986,27 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
             archive_delivered = verified_count > 0 and delivered_batches and not fromstart_failed.is_set()
             _cleanup_live_files(bg_id, preserve_paths=failed_paths)
 
-    async def _concat_parts(part_files, output_ts):
-        """Concatenate multiple .ts part files using binary concat (TS is designed for this)."""
-        if len(part_files) == 1:
-            os.rename(part_files[0], output_ts)
-            return True
-        try:
-            with open(output_ts, 'wb') as out:
-                for p in part_files:
-                    if os.path.exists(p) and os.path.getsize(p) > 0:
-                        with open(p, 'rb') as inp:
-                            while True:
-                                chunk = inp.read(8 * 1024 * 1024)
-                                if not chunk:
-                                    break
-                                out.write(chunk)
-            if os.path.exists(output_ts) and os.path.getsize(output_ts) > 0:
-                for p in part_files:
-                    try: os.remove(p)
-                    except: pass
-                return True
-            else:
-                logger.error(f"[LIVE:{task_id}] binary concat produced empty file")
-                try: os.remove(output_ts)
-                except: pass
-                return False
-        except Exception as e:
-            logger.error(f"[LIVE:{task_id}] binary concat error: {e}")
-            try: os.remove(output_ts)
-            except: pass
-            return False
+    def _segment_parts(part_files):
+        """Closed recorder parts that hold media, in recording order."""
+        return [p for p in part_files if os.path.exists(p) and os.path.getsize(p) > 1024]
 
-    async def _remux_and_upload(ts_path, mp4_path, seg_num, is_final=False, completion_reason='confirmed_end'):
-        """Background task: remux .ts to .mp4 and upload."""
+    async def _remux_and_upload(ts_parts, mp4_path, seg_num, is_final=False, completion_reason='confirmed_end'):
+        """Background task: remux one segment's .ts parts to .mp4 and upload.
+
+        MPEG-TS parts are read back to back through FFmpeg's concat protocol,
+        the same byte stream a binary concatenation would produce, without
+        first copying ~1.9GB on the event loop.
+        """
+        ts_parts = list(ts_parts)
         try:
-            ts_size = os.path.getsize(ts_path) if os.path.exists(ts_path) else 0
+            ts_size = sum(os.path.getsize(p) for p in ts_parts if os.path.exists(p))
             if ts_size == 0:
-                try: os.remove(ts_path)
-                except: pass
+                for p in ts_parts:
+                    _safe_remove(p)
                 return
+            source = ts_parts[0] if len(ts_parts) == 1 else 'concat:' + '|'.join(ts_parts)
 
-            logger.info(f"[LIVE:{task_id}] BG remux seg {seg_num}: {ts_size/(1024*1024):.1f}MB")
+            logger.info(f"[LIVE:{task_id}] BG remux seg {seg_num}: {ts_size/(1024*1024):.1f}MB from {len(ts_parts)} part(s)")
             remux_stderr_tail = bytearray()
 
             async def _attempt_remux(include_faststart):
@@ -1013,7 +1014,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                     get_ffmpeg_command(), '-y',
                     '-err_detect', 'ignore_err',
                     '-fflags', '+genpts+discardcorrupt',
-                    '-i', ts_path, '-c', 'copy',
+                    '-i', source, '-c', 'copy',
                 ]
                 if include_faststart:
                     args += ['-movflags', '+faststart']
@@ -1037,7 +1038,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
 
             output_size = os.path.getsize(mp4_path) if os.path.exists(mp4_path) else 0
             if remux_code != 0 or output_size <= 1024:
-                live_failed_paths.add(ts_path)
+                live_failed_paths.update(ts_parts)
                 reason = remux_stderr_tail.decode(errors='replace').strip()[-1000:]
                 logger.error("[LIVE:%s] Remux produced no valid output for seg %s: %s", task_id, seg_num, reason)
                 await live_status(
@@ -1051,11 +1052,12 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                 try:
                     await asyncio.to_thread(probe_media, mp4_path)
                 except ValueError as exc:
-                    live_failed_paths.add(ts_path)
+                    live_failed_paths.update(ts_parts)
                     _safe_remove(mp4_path)
                     await live_status(f"⚠️ Live segment {seg_num}: {exc}. Source retained in downloads/.")
                     return
-            _safe_remove(ts_path)
+            for p in ts_parts:
+                _safe_remove(p)
 
             upload_size = os.path.getsize(mp4_path) if os.path.exists(mp4_path) else 0
             if upload_size > 0:
@@ -1092,7 +1094,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
             else:
                 logger.warning(f"[LIVE:{task_id}] BG remux produced empty file seg {seg_num}")
         except Exception as e:
-            live_failed_paths.update(p for p in (ts_path, mp4_path) if os.path.exists(p))
+            live_failed_paths.update(p for p in (*ts_parts, mp4_path) if os.path.exists(p))
             logger.error(f"[LIVE:{task_id}] BG remux/upload seg {seg_num} error: {e}", exc_info=True)
 
     async def _start_recording(part_path, proxy_list):
@@ -1307,7 +1309,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
         if process is None:
             if termination_reason == 'cancelled':
                 await live_status("❌ Live recording cancelled.")
-                return
+                return 'cancelled'
             if termination_reason == 'proxy_exhausted':
                 await live_status("⚠️ Proxy/source recovery timed out before recording could start.\nLive status was not confirmed.")
             elif termination_reason == 'confirmed_end':
@@ -1326,7 +1328,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
             # intentionally stopped. Manual actions still need to be handled.
             if process is None and task_id in cancelled_tasks:
                 await live_status("❌ Live recording cancelled.")
-                return
+                return 'cancelled'
             if process is None and task_id in stopped_tasks:
                 termination_reason = 'stopped'
                 break
@@ -1371,7 +1373,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                 if process is None:
                     if termination_reason == 'cancelled':
                         await live_status("❌ Live recording cancelled.")
-                        return
+                        return 'cancelled'
                     break
                 await live_status(f"🔴 Recording live stream: {channel_name}")
                 continue
@@ -1392,7 +1394,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                     except: pass
                     if termination_reason == 'cancelled':
                         await live_status("❌ Live recording cancelled.")
-                        return
+                        return 'cancelled'
                     break
                 await live_status(f"🔴 Recording live stream: {channel_name}")
                 poll_count = 0
@@ -1404,7 +1406,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                 await _kill_process(process, task_id)
                 # Leave the signal in place so the from-start worker cancels too.
                 await live_status("❌ Live recording cancelled.")
-                return
+                return 'cancelled'
 
             # Check stop & upload
             if task_id in stopped_tasks:
@@ -1412,28 +1414,13 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                 logger.info(f"[LIVE:{task_id}] Stop & Upload signal")
                 await _kill_process(process, task_id)
                 # Leave the signal in place so the from-start worker finalizes too.
-                # Filter out empty/tiny parts before concat
-                valid_parts = [p for p in part_files if os.path.exists(p) and os.path.getsize(p) > 1024]
-                total_size = sum(os.path.getsize(p) for p in valid_parts)
-                if total_size > 0 and valid_parts:
+                # Empty/tiny parts carry no media and are dropped.
+                valid_parts = _segment_parts(part_files)
+                if valid_parts:
                     segment_num += 1
-                    seg_ts = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_{segment_num:03d}.ts")
                     seg_mp4 = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_{segment_num:03d}.mp4")
-                    if await _concat_parts(valid_parts, seg_ts):
-                        bg_tasks.append(asyncio.create_task(_remux_and_upload(seg_ts, seg_mp4, segment_num, is_final=True, completion_reason='stopped')))
-                        uploaded_segments.append(segment_num)
-                    elif len(valid_parts) == 1:
-                        # Concat not needed for single file — just rename
-                        os.rename(valid_parts[0], seg_ts)
-                        bg_tasks.append(asyncio.create_task(_remux_and_upload(seg_ts, seg_mp4, segment_num, is_final=True, completion_reason='stopped')))
-                        uploaded_segments.append(segment_num)
-                    else:
-                        # Concat failed — try uploading each part individually
-                        logger.warning(f"[LIVE:{task_id}] Concat failed, uploading parts individually")
-                        for pi, p in enumerate(valid_parts, 1):
-                            p_mp4 = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_part{pi:03d}.mp4")
-                            bg_tasks.append(asyncio.create_task(_remux_and_upload(p, p_mp4, pi, is_final=(pi == len(valid_parts)), completion_reason='stopped')))
-                        uploaded_segments.append(segment_num)
+                    bg_tasks.append(asyncio.create_task(_remux_and_upload(valid_parts, seg_mp4, segment_num, is_final=True, completion_reason='stopped')))
+                    uploaded_segments.append(segment_num)
                 # Clean up empty parts
                 for p in part_files:
                     if p not in valid_parts and os.path.exists(p):
@@ -1467,19 +1454,15 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                 # 2. Kill old process
                 await _kill_process(process, task_id)
 
-                # 3. Concat current parts into segment, send to background upload
+                # 3. Hand the closed parts to the background remux/upload
                 segment_num += 1
-                seg_ts = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_{segment_num:03d}.ts")
                 seg_mp4 = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_{segment_num:03d}.mp4")
-                if await _concat_parts(part_files, seg_ts):
-                    bg_tasks.append(asyncio.create_task(_remux_and_upload(seg_ts, seg_mp4, segment_num)))
-                    uploaded_segments.append(segment_num)
-                else:
-                    for pi, p in enumerate(part_files, 1):
-                        if os.path.exists(p) and os.path.getsize(p) > 1024:
-                            p_mp4 = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_fallback{pi:03d}.mp4")
-                            bg_tasks.append(asyncio.create_task(_remux_and_upload(p, p_mp4, pi)))
-                    uploaded_segments.append(segment_num)
+                segment_parts = _segment_parts(part_files)
+                for p in part_files:
+                    if p not in segment_parts:
+                        _safe_remove(p)
+                bg_tasks.append(asyncio.create_task(_remux_and_upload(segment_parts, seg_mp4, segment_num)))
+                uploaded_segments.append(segment_num)
 
                 # 4. Reset parts for next segment
                 part_files = [next_part]
@@ -1516,7 +1499,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
             bg_tasks.clear()
 
         if task_id in cancelled_tasks:
-            return
+            return 'cancelled'
         replay_delivered = False
         if is_youtube and termination_reason == 'confirmed_end' and expected_live_video_id:
             replay_path = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_replay.mp4")
@@ -1532,7 +1515,7 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                 logger.warning("[LIVE:%s] Could not prepare replay: %s", task_id, exc)
                 info = None
             if task_id in cancelled_tasks:
-                return
+                return 'cancelled'
             if info:
                 await live_status(f"✅ Replay verified: {info.describe()}")
                 replay_delivered = await handle_upload(
@@ -1550,25 +1533,12 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
 
         # Upload remaining parts if any
         if part_files and not replay_delivered:
-            valid_parts = [p for p in part_files if os.path.exists(p) and os.path.getsize(p) > 1024]
-            total_size = sum(os.path.getsize(p) for p in valid_parts) if valid_parts else 0
-            if total_size > 0 and valid_parts:
+            valid_parts = _segment_parts(part_files)
+            if valid_parts:
                 segment_num += 1
-                seg_ts = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_{segment_num:03d}.ts")
                 seg_mp4 = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_{segment_num:03d}.mp4")
-                if await _concat_parts(valid_parts, seg_ts):
-                    bg_tasks.append(asyncio.create_task(_remux_and_upload(seg_ts, seg_mp4, segment_num, is_final=True, completion_reason=termination_reason)))
-                    uploaded_segments.append(segment_num)
-                elif len(valid_parts) == 1:
-                    os.rename(valid_parts[0], seg_ts)
-                    bg_tasks.append(asyncio.create_task(_remux_and_upload(seg_ts, seg_mp4, segment_num, is_final=True, completion_reason=termination_reason)))
-                    uploaded_segments.append(segment_num)
-                else:
-                    logger.warning(f"[LIVE:{task_id}] Final concat failed, uploading parts individually")
-                    for pi, p in enumerate(valid_parts, 1):
-                        p_mp4 = os.path.join(DOWNLOAD_DIR, f"live_{task_id}_part{pi:03d}.mp4")
-                        bg_tasks.append(asyncio.create_task(_remux_and_upload(p, p_mp4, pi, is_final=(pi == len(valid_parts)), completion_reason=termination_reason)))
-                    uploaded_segments.append(segment_num)
+                bg_tasks.append(asyncio.create_task(_remux_and_upload(valid_parts, seg_mp4, segment_num, is_final=True, completion_reason=termination_reason)))
+                uploaded_segments.append(segment_num)
             # Clean up empty parts
             for p in part_files:
                 if p not in valid_parts and os.path.exists(p):
@@ -1584,10 +1554,10 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
             for backup in reserve_parts:
                 if os.path.isfile(backup) and os.path.getsize(backup) > 1024:
                     segment_num += 1
-                    await _remux_and_upload(backup, backup + '.mp4', segment_num)
+                    await _remux_and_upload([backup], backup + '.mp4', segment_num)
         logger.info(f"[LIVE:{task_id}] COMPLETE. Segments: {len(uploaded_segments)}, reason={termination_reason}")
         if task_id in cancelled_tasks:
-            return
+            return 'cancelled'
         gap_note = ""
         if recovery_gaps and not (archive_accepted or replay_delivered):
             gaps = "\n".join(recovery_gaps[-10:])
@@ -1606,9 +1576,12 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
         elif gap_note:
             await live_status("⚠️ Live-edge recording finished." + gap_note)
         elif status_msg:
+            # A queued edit must not land after (or race) the deletion.
+            await live_status_publisher.flush()
             try: await tg_retry(status_msg.delete)
             except Exception as e:
                 logger.warning(f"[LIVE:{task_id}] Could not delete status msg: {e}")
+        return termination_reason
 
     except Exception as e:
         live_failed_paths.update(reserve_parts)
@@ -1626,6 +1599,8 @@ async def process_live_stream(application, chat_id, url, message_id, status_msg,
                 await asyncio.gather(*bg_tasks, return_exceptions=True)
         except NameError:
             pass
+        # The task is finished only once its final status has reached Telegram.
+        await live_status_publisher.flush()
         stopped_tasks.discard(task_id)
         cancelled_tasks.discard(task_id)
         _cleanup_live_files(task_id, preserve_paths=live_failed_paths)
