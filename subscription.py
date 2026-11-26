@@ -4,6 +4,8 @@ Monitors YouTube channels for new videos.
 """
 
 import asyncio
+import functools
+import html
 import logging
 from datetime import datetime
 
@@ -19,6 +21,16 @@ from telegram_utils import tg_retry
 
 logger = logging.getLogger(__name__)
 
+# Recording outcomes after which the same broadcast must not be recorded again
+# for that chat. Any other outcome (proxy outage, crash, bot shutdown) leaves
+# the broadcast eligible, so the next poll restarts it while it is still live.
+FINAL_LIVE_OUTCOMES = ('confirmed_end', 'stopped', 'cancelled')
+MAX_LIVE_RECORDING_ATTEMPTS = 3
+
+
+def _live_done_key(video_id, chat_id):
+    return f"live_{video_id}_{chat_id}"
+
 class SubscriptionMonitor:
     """Monitor subscribed channels for new videos."""
 
@@ -28,7 +40,7 @@ class SubscriptionMonitor:
         self.running = False
         self.task = None
         self.active_live_recordings = set()
-        self._live_channel_map = {}  # video_id -> channel_id
+        self._live_attempts = {}  # rec_key -> (channel_id, abnormal endings so far)
     
     async def start(self):
         """Start the subscription monitor."""
@@ -131,26 +143,35 @@ class SubscriptionMonitor:
                 mark_video_processed(video_id, channel_id, video['title'])
                 
                 for sub in subscribers:
-                    try:
-                        status_msg = await tg_retry(self.application.bot.send_message,
-                            chat_id=sub['chat_id'],
-                            text=f"🔔 **New Video from {channel_name}**\n\n"
-                                 f"📹 {video['title']}\n\n"
-                                 f"⬇️ Starting download ({sub['max_quality']}p)...",
-                            parse_mode='Markdown'
-                        )
-                        await self.request_queue.put((
-                            sub['chat_id'],
-                            video['url'],
-                            None,
-                            sub['max_quality'],
-                            status_msg,
-                            channel_name
-                        ))
-                    except Exception as e:
-                        logger.error(f"Failed to notify chat {sub['chat_id']}: {e}")
+                    status_msg = await self._notify(
+                        sub['chat_id'],
+                        f"🔔 <b>New Video from {html.escape(str(channel_name))}</b>\n\n"
+                        f"📹 {html.escape(str(video['title']))}\n\n"
+                        f"⬇️ Starting download ({sub['max_quality']}p)...",
+                    )
+                    # The video is already marked processed, so it must be
+                    # queued even when the notification could not be sent.
+                    await self.request_queue.put((
+                        sub['chat_id'],
+                        video['url'],
+                        None,
+                        sub['max_quality'],
+                        status_msg,
+                        channel_name
+                    ))
         except Exception as e:
             logger.error(f"Error checking videos for {channel_id}: {e}")
+
+    async def _notify(self, chat_id, text):
+        """Send an HTML notification; a failure must never drop the queued task."""
+        try:
+            return await tg_retry(
+                self.application.bot.send_message,
+                chat_id=chat_id, text=text, parse_mode='HTML',
+            )
+        except Exception as e:
+            logger.error(f"Failed to notify chat {chat_id}: {e}")
+            return None
 
     async def _check_live(self, channel_id, channel_name, subscribers):
         """Check a specific channel for active live streams."""
@@ -158,56 +179,87 @@ class SubscriptionMonitor:
             loop = asyncio.get_running_loop()
             live_info = await loop.run_in_executor(None, lambda: get_live_info(channel_id))
             if live_info.state == 'LIVE':
-                live_info = live_info.info
-                live_id = f"live_{live_info['id']}"
-                if not is_video_processed(live_id):
-                    logger.info(f"New LIVE stream found: {live_info['title']} from {channel_name}")
-                    mark_video_processed(live_id, channel_id, live_info['title'])
-
-                    for sub in subscribers:
-                        # Use video_id + chat_id so same channel can have multiple concurrent streams
-                        rec_key = f"{live_info['id']}_{sub['chat_id']}"
-                        if rec_key in self.active_live_recordings:
-                            logger.info(f"Skipping duplicate live recording {live_info['id']} in chat {sub['chat_id']}")
-                            continue
-                        self.active_live_recordings.add(rec_key)
-                        self._live_channel_map[live_info['id']] = channel_id
-                        try:
-                            msg = await tg_retry(self.application.bot.send_message,
-                                chat_id=sub['chat_id'],
-                                text=f"🔴 **LIVE: {channel_name} is streaming now!**\n\n"
-                                     f"📹 {live_info['title']}\n\n"
-                                     f"⏳ Recording and segmented upload started (1.9GB chunks)...",
-                                parse_mode='Markdown'
-                            )
-                            await self.request_queue.put((
-                                sub['chat_id'],
-                                live_info['url'],
-                                None,
-                                sub['max_quality'],
-                                msg,
-                                channel_name,
-                                True, # is_live
-                                live_info['id'],
-                            ))
-                        except Exception as e:
-                            self.active_live_recordings.discard(rec_key)
-                            logger.error(f"Failed to notify live for chat {sub['chat_id']}: {e}")
+                await self._start_live_recordings(channel_id, channel_name, subscribers, live_info.info)
             elif live_info.state == 'ENDED':
-                # Channel no longer live — clear active recording locks for this channel
-                video_ids_for_channel = [vid for vid, cid in self._live_channel_map.items() if cid == channel_id]
-                to_remove = set()
-                for vid in video_ids_for_channel:
-                    for key in self.active_live_recordings:
-                        if key.startswith(f"{vid}_"):
-                            to_remove.add(key)
-                    del self._live_channel_map[vid]
-                if to_remove:
-                    self.active_live_recordings -= to_remove
+                # Recording locks are released by the recordings themselves.
+                # Only forget restart counters for broadcasts that are over.
+                for rec_key, (owner, _) in list(self._live_attempts.items()):
+                    if owner == channel_id and rec_key not in self.active_live_recordings:
+                        del self._live_attempts[rec_key]
             else:
                 logger.warning("Live state for %s is unknown; keeping recording locks", channel_id)
         except Exception as e:
             logger.error(f"Error checking live for {channel_id}: {e}")
+
+    async def _start_live_recordings(self, channel_id, channel_name, subscribers, live_info):
+        video_id = live_info['id']
+        for sub in subscribers:
+            chat_id = sub['chat_id']
+            # Use video_id + chat_id so same channel can have multiple concurrent streams
+            rec_key = f"{video_id}_{chat_id}"
+            if rec_key in self.active_live_recordings:
+                logger.info(f"Skipping duplicate live recording {video_id} in chat {chat_id}")
+                continue
+            if is_video_processed(_live_done_key(video_id, chat_id)):
+                continue
+            self.active_live_recordings.add(rec_key)
+            previous_failures = self._live_attempts.get(rec_key, (channel_id, 0))[1]
+            if previous_failures:
+                logger.warning(
+                    "Restarting live recording %s in chat %s (attempt %s/%s)",
+                    video_id, chat_id, previous_failures + 1, MAX_LIVE_RECORDING_ATTEMPTS,
+                )
+                headline = (
+                    f"🔁 <b>LIVE: recording of {html.escape(str(channel_name))} ended early; "
+                    f"restarting ({previous_failures + 1}/{MAX_LIVE_RECORDING_ATTEMPTS})</b>"
+                )
+            else:
+                logger.info(f"New LIVE stream found: {live_info['title']} from {channel_name}")
+                headline = f"🔴 <b>LIVE: {html.escape(str(channel_name))} is streaming now!</b>"
+            try:
+                msg = await self._notify(
+                    chat_id,
+                    f"{headline}\n\n"
+                    f"📹 {html.escape(str(live_info['title']))}\n\n"
+                    f"⏳ Recording and segmented upload started (1.9GB chunks)...",
+                )
+                await self.request_queue.put((
+                    chat_id,
+                    live_info['url'],
+                    None,
+                    sub['max_quality'],
+                    msg,
+                    channel_name,
+                    True,  # is_live
+                    video_id,
+                    functools.partial(self._live_recording_finished, rec_key, chat_id,
+                                      channel_id, video_id, live_info['title']),
+                ))
+            except Exception as e:
+                self.active_live_recordings.discard(rec_key)
+                logger.error(f"Failed to queue live recording for chat {chat_id}: {e}")
+
+    def _live_recording_finished(self, rec_key, chat_id, channel_id, video_id, title, outcome):
+        """Release the lock; mark the broadcast done only when it really is."""
+        self.active_live_recordings.discard(rec_key)
+        if outcome in FINAL_LIVE_OUTCOMES:
+            self._live_attempts.pop(rec_key, None)
+            mark_video_processed(_live_done_key(video_id, chat_id), channel_id, title)
+            return
+        failures = self._live_attempts.get(rec_key, (channel_id, 0))[1] + 1
+        if failures >= MAX_LIVE_RECORDING_ATTEMPTS:
+            logger.error(
+                "Live recording %s in chat %s ended abnormally %s times (%s); not restarting",
+                video_id, chat_id, failures, outcome,
+            )
+            self._live_attempts.pop(rec_key, None)
+            mark_video_processed(_live_done_key(video_id, chat_id), channel_id, title)
+            return
+        self._live_attempts[rec_key] = (channel_id, failures)
+        logger.warning(
+            "Live recording %s in chat %s ended with %s; it will restart if still live",
+            video_id, chat_id, outcome,
+        )
 
 async def check_channel_now(channel_id, channel_name, chat_id, max_quality, application, request_queue):
     """Manually trigger a channel check."""
@@ -225,10 +277,16 @@ async def check_channel_now(channel_id, channel_name, chat_id, max_quality, appl
             new_count += 1
             mark_video_processed(video_id, channel_id, video['title'])
             
-            status_msg = await application.bot.send_message(
-                chat_id=chat_id,
-                text=f"📹 Found: {video['title']}\n⬇️ Starting download..."
-            )
+            try:
+                status_msg = await tg_retry(
+                    application.bot.send_message,
+                    chat_id=chat_id,
+                    text=f"📹 Found: {video['title']}\n⬇️ Starting download..."
+                )
+            except Exception as e:
+                # Already marked processed: queue it even without a status message.
+                logger.error(f"Failed to notify chat {chat_id}: {e}")
+                status_msg = None
             
             await request_queue.put((chat_id, video['url'], None, max_quality, status_msg, channel_name))
         

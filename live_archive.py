@@ -196,9 +196,14 @@ async def record_dvr(url, proxy, cookies, prefix, on_chunk, should_stop, is_canc
                 except asyncio.TimeoutError:
                     await stop_process(mux)
             await asyncio.gather(*drains)
-        if not is_cancelled():
+        failed = any(p.returncode != 0 for p in processes)
+        # After a source failure, FFmpeg closes the open segment where the data
+        # stopped. That truncated chunk must not become the checkpoint: a later
+        # attempt replays the full minute at the same ordinal, whose last packet
+        # can never match. Discard it and let the next attempt record it whole.
+        if not is_cancelled() and (should_stop() or not failed):
             await collect()
-        if not should_stop() and (not consumed or any(p.returncode != 0 for p in processes)):
+        if not should_stop() and (not consumed or failed):
             hints = [error_hint(t.decode(errors='replace')) for t in tails]
             raise ValueError(next((h for h in hints if h), 'DVR stream unavailable or interrupted'))
 

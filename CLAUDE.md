@@ -26,16 +26,17 @@ A Telegram bot that downloads videos/audio via yt-dlp, runs as a Docker containe
 2. **queue_processor.py** — Consumes queues sequentially. Runs yt-dlp in `run_in_executor` (blocking I/O). Manages live stream recording via streamlink subprocesses. Handles segmented upload for large files.
 3. **downloader.py** — yt-dlp wrapper with proxy rotation. `_apply_cookie()` is the central hook for all yt-dlp invocations (injects cookies, EJS runtime, logging). `RETRY_ERRORS` + `is_retryable_error()` control which errors trigger proxy fallover and WARP IP rotation.
 4. **uploader.py** — Handles chunked streaming upload to Local Bot API, file splitting via ffmpeg, thumbnail cropping.
-5. **subscription.py** — `SubscriptionMonitor` polls channels every N seconds, deduplicates via `is_video_processed()` in SQLite, tracks active live recordings to prevent duplicates.
+5. **subscription.py** — `SubscriptionMonitor` polls channels every N seconds, deduplicates via `is_video_processed()` in SQLite, tracks active live recordings to prevent duplicates. A live broadcast is marked done (`live_{video_id}_{chat_id}`) only when its recording reports `confirmed_end`, `stopped` or `cancelled` through the queue tuple's completion callback; a proxy outage, crash or bot restart leaves it eligible, so the next poll restarts it (at most 3 attempts).
 
 ### Key Patterns
 
 - **Single status message**: One message per task, edited in-place. Never spam multiple messages. Pass `status_msg` through the queue.
-- **tg_retry()**: All Telegram API calls in high-frequency paths must use this wrapper (handles flood control + NetworkError).
-- **Proxy rotation**: `get_proxy_list()` returns ordered list. On retryable errors, iterate to next proxy. WARP proxy failures trigger `/restart` endpoint for IP rotation.
+- **tg_retry()**: All Telegram API calls in high-frequency paths must use this wrapper (handles flood control). Note that it re-raises `NetworkError`/`TimedOut` instead of retrying them.
+- **Live status edits**: `process_live_stream` publishes through `BackgroundStatusPublisher`, which sends edits in order without making the recording loop wait and collapses the backlog to the newest text during a flood-control wait. Never await Telegram inside the recording loop.
+- **Proxy rotation**: `get_proxy_list()` returns ordered list. On retryable errors, iterate to next proxy. WARP proxy failures trigger `/restart` endpoint for IP rotation, except while any live recording is active (`downloader.active_live_tasks`) or for private/removed content; only the live recorder's own recovery may rotate WARP then.
 - **yt-dlp is synchronous**: Always wrap in `loop.run_in_executor(None, lambda: ...)`.
 - **Memory management**: `PYTHONMALLOC=malloc` in Dockerfile (musl returns pages to OS on free). `_free_memory()` called after every task.
-- **Live stream recording**: Starts streamlink for the live edge and yt-dlp `--live-from-start` in parallel. If the from-start archive records normally for 10 minutes, streamlink is stopped and its duplicate temporary files are discarded; only the full from-start archive continues. A missing DVR/VOD only stops the from-start archive, so the live-edge recorder remains as the fallback. Both use 1.9GB segments. Graceful shutdown: SIGINT → SIGTERM → SIGKILL.
+- **Live stream recording**: Starts streamlink for the live edge and yt-dlp `--live-from-start` in parallel. If the from-start archive records normally for 10 minutes, streamlink is stopped and its duplicate temporary files are discarded; only the full from-start archive continues. A missing DVR/VOD only stops the from-start archive, so the live-edge recorder remains as the fallback. Both use 1.9GB segments. A segment's live-edge `.ts` parts (one per reconnect) are remuxed in place through FFmpeg's `concat:` protocol; never copy them on the event loop. A failed DVR attempt discards its truncated last chunk, so the next proxy can replay and rejoin at the last verified chunk. Graceful shutdown: SIGINT → SIGTERM → SIGKILL.
 
 ### Environment & Config
 

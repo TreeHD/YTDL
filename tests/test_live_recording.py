@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import downloader
 from live_archive import MediaInfo, closed_chunks
 import queue_processor as qp
 
@@ -40,7 +41,10 @@ class TestLiveRecording(unittest.IsolatedAsyncioTestCase):
         archive_scenario = scenario in ('archive_eof', 'archive_stall', 'proxy_retry', 'missing_audio', 'resume', 'mismatch', 'bad_mp4')
         attempts = []
         check_replay = scenario in ('public_replay', 'no_replay')
+        reconnect = scenario == 'reconnect'
         replay_ids = []
+        self.remux_inputs = []
+        self.parts_left_at_upload = []
 
         async def replay(video_id, proxies, cookies, target, stopping, *coverage):
             replay_ids.append(video_id)
@@ -77,13 +81,11 @@ class TestLiveRecording(unittest.IsolatedAsyncioTestCase):
 
         async def status(text, **kwargs):
             statuses.append(text)
-            if check_replay and 'Recording live stream' in text:
+            if (check_replay or reconnect) and 'Recording live stream' in text:
                 recorders[0].returncode = 1
             if 'Live-edge backup stopped' in text:
                 retired.set()
             if 'missing audio packets' in text or 'timelines differ' in text:
-                qp.stopped_tasks.add(task_id)
-            if 'Part 3)' in text:
                 qp.stopped_tasks.add(task_id)
 
         async def sleep(delay):
@@ -96,6 +98,9 @@ class TestLiveRecording(unittest.IsolatedAsyncioTestCase):
 
         async def upload(*args, **kwargs):
             uploads.append(args[3])
+            self.parts_left_at_upload.extend(
+                name for name in os.listdir(os.path.dirname(args[2])) if name.endswith('.ts')
+            )
             if scenario == 'archive_eof' and 'From Start' in args[3]:
                 archive_upload_started.set()
                 await resumed.wait()
@@ -116,6 +121,12 @@ class TestLiveRecording(unittest.IsolatedAsyncioTestCase):
                         size = 2048 if len(recorders) == 1 else 0
                         if not size:
                             proc.returncode = 1
+                    elif reconnect:
+                        # The first recorder drops mid-segment; the second one
+                        # continues the same segment, then the user stops.
+                        size = 2048
+                        if len(recorders) == 2:
+                            qp.stopped_tasks.add(task_id)
                     elif archive_scenario:
                         size = 2048
                         if len(recorders) == 2:
@@ -130,11 +141,18 @@ class TestLiveRecording(unittest.IsolatedAsyncioTestCase):
                         if scenario == 'empty_handoff' and len(recorders) == 3:
                             self.assertIsNone(recorders[0].returncode)
                             self.assertEqual(recorders[1].returncode, 0)
+                        # Stop once the Part 3 recorder exists. Status edits are
+                        # delivered in the background, so a status text cannot
+                        # serve as a synchronous hook for this.
+                        if len(recorders) == (4 if scenario == 'empty_handoff' else 3):
+                            qp.stopped_tasks.add(task_id)
                         size = 1900 * 1024 * 1024
                     with open(path, 'wb') as media:
                         # Sparse files exercise the real size threshold without disk I/O.
                         media.truncate(size)
                     return proc
+                if '-i' in cmd and '-f' not in cmd:
+                    self.remux_inputs.append(cmd[cmd.index('-i') + 1])
                 with open(cmd[-1], 'wb') as media:
                     media.write(b'm' * 2048)
                 return FakeProcess(returncode=0)
@@ -233,6 +251,39 @@ class TestLiveRecording(unittest.IsolatedAsyncioTestCase):
         _, _, uploads, _ = await self.run_recording('no_replay')
         self.assertEqual(len(uploads), 1)
         self.assertIn('LIVE Part', uploads[0])
+
+    async def test_reconnected_segment_is_remuxed_from_parts_without_copying(self):
+        _, _, uploads, _ = await self.run_recording('reconnect')
+        self.assertEqual(uploads, ['\U0001f534 Channel - LIVE Part 1 (Stopped by user)'])
+        self.assertEqual(len(self.remux_inputs), 1)
+        source = self.remux_inputs[0]
+        self.assertTrue(source.startswith('concat:'), source)
+        self.assertEqual([os.path.basename(p) for p in source[len('concat:'):].split('|')],
+                         ['live_test_live_p001.ts', 'live_test_live_p002.ts'])
+        # Parts are released once the MP4 is verified, before the upload.
+        self.assertEqual(self.parts_left_at_upload, [])
+
+    async def test_tracked_recording_reports_outcome_and_blocks_warp_rotation(self):
+        self.assertIs(qp.active_live_tasks, downloader.active_live_tasks)
+        args = (None, 1, 'url', 2, None, 'tracked-task', None, 'Channel', 'vid')
+        seen, outcomes = [], []
+
+        async def finished(*_):
+            seen.append(set(downloader.active_live_tasks))
+            return 'proxy_exhausted'
+
+        with patch.object(qp, 'process_live_stream', finished):
+            await qp.process_live_stream_tracked(*args, on_finished=outcomes.append)
+        self.assertEqual(seen, [{'tracked-task'}])
+        self.assertEqual(outcomes, ['proxy_exhausted'])
+        self.assertNotIn('tracked-task', downloader.active_live_tasks)
+
+        async def crashed(*_):
+            raise RuntimeError('boom')
+
+        with patch.object(qp, 'process_live_stream', crashed), self.assertRaises(RuntimeError):
+            await qp.process_live_stream_tracked(*args, on_finished=outcomes.append)
+        self.assertEqual(outcomes, ['proxy_exhausted', 'error'])
 
     def test_only_closed_segments_from_ffmpeg_manifest_are_consumed(self):
         with tempfile.TemporaryDirectory() as directory:

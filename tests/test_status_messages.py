@@ -3,8 +3,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import BadRequest
-from telegram_utils import StatusMessageEditor, tg_retry
+from telegram.error import BadRequest, RetryAfter, TimedOut
+from telegram_utils import BackgroundStatusPublisher, StatusMessageEditor, tg_retry
 
 
 class StatusTests(unittest.IsolatedAsyncioTestCase):
@@ -56,3 +56,55 @@ class StatusTests(unittest.IsolatedAsyncioTestCase):
         await editor.edit(first, 'progress')
         await editor.edit(second, 'progress')
         second.edit_text.assert_awaited_once()
+
+
+class BackgroundPublisherTests(unittest.IsolatedAsyncioTestCase):
+    def message(self):
+        return SimpleNamespace(text='initial', reply_markup=None, edit_text=AsyncMock())
+
+    async def test_publish_never_waits_and_delivers_in_order(self):
+        message = self.message()
+        publisher = BackgroundStatusPublisher()
+        for text in ('a', 'b', 'c'):
+            publisher.publish(message, text)
+        message.edit_text.assert_not_awaited()
+        await publisher.flush()
+        self.assertEqual([call.args[0] for call in message.edit_text.await_args_list], ['a', 'b', 'c'])
+
+    async def test_flood_wait_does_not_block_callers_and_sends_only_newest(self):
+        message = self.message()
+        sent = []
+
+        async def edit(text, reply_markup=None):
+            if not sent:
+                sent.append('flood')
+                raise RetryAfter(30)
+            sent.append(text)
+
+        message.edit_text = edit
+        waiting, release = asyncio.Event(), asyncio.Event()
+
+        async def flood_wait(delay):
+            self.assertEqual(delay, 30)
+            waiting.set()
+            await release.wait()
+
+        publisher = BackgroundStatusPublisher()
+        with patch('telegram_utils.asyncio.sleep', flood_wait):
+            publisher.publish(message, 'first')
+            await waiting.wait()
+            # The recording loop keeps running while Telegram makes us wait.
+            for text in ('second', 'third', 'newest'):
+                publisher.publish(message, text)
+            release.set()
+            await publisher.flush()
+        self.assertEqual(sent, ['flood', 'newest'])
+
+    async def test_network_error_is_retried(self):
+        message = self.message()
+        message.edit_text.side_effect = [TimedOut(), True]
+        publisher = BackgroundStatusPublisher()
+        with patch('telegram_utils.asyncio.sleep', new_callable=AsyncMock):
+            publisher.publish(message, 'progress')
+            await publisher.flush()
+        self.assertEqual(message.edit_text.await_count, 2)

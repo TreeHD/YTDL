@@ -35,6 +35,26 @@ class LiveProbeResult:
 
 TWITCH_CHANNEL_PREFIX = 'twitch:'
 
+# Live recordings hold long-lived connections through the proxies. Rotating the
+# WARP IP for an ordinary download or channel poll would cut every recording
+# that is using it, so only the live recorder itself may decide to rotate while
+# any recording is active. Mutated on the event loop, read from executor threads.
+active_live_tasks = set()
+
+# Rotating the exit IP cannot make removed or private content available.
+NO_WARP_ROTATION_ERRORS = (
+    'private video',
+    'removed by the uploader',
+)
+
+
+def _is_twitch_offline(exc):
+    """yt-dlp reports an offline Twitch channel as an extractor error."""
+    original = getattr(exc, 'exc_info', None)
+    if original and len(original) > 1 and isinstance(original[1], UserNotLive):
+        return True
+    return 'not currently live' in str(exc).lower()
+
 # Download titles can exceed filesystem filename limits, especially for CJK
 # titles. Keep disk filenames stable and short; the original title is still
 # returned from yt-dlp for Telegram messages and upload captions.
@@ -112,6 +132,11 @@ def probe_live_state(url, expected_video_id=None):
                 return LiveProbeResult('LIVE', info, errors)
             return LiveProbeResult('ENDED', info, errors)
         except Exception as exc:
+            # An offline Twitch channel is a successful answer, not a transport
+            # failure. Without this the recorder could never confirm the end
+            # and would wait out the whole proxy-recovery window instead.
+            if is_twitch_url(url) and _is_twitch_offline(exc):
+                return LiveProbeResult('ENDED', errors=errors)
             errors.append(str(getattr(exc, 'source', exc))[:300])
     return LiveProbeResult('UNKNOWN', errors=errors)
 
@@ -178,7 +203,12 @@ def is_retryable_error(error_msg, proxy_url=None):
         if is_geo_restriction:
             logger.info("Geo restriction detected; trying the next proxy without rotating WARP.")
         elif proxy_url and 'warp-proxy' in proxy_url:
-            restart_warp_proxy()
+            if active_live_tasks:
+                logger.info("Live recording active; trying the next proxy without rotating WARP.")
+            elif any(pattern in error_lower for pattern in NO_WARP_ROTATION_ERRORS):
+                logger.info("Content is unavailable; trying the next proxy without rotating WARP.")
+            else:
+                restart_warp_proxy()
     return matched
 
 _cookie_logged = False
@@ -641,7 +671,7 @@ def get_live_info(channel_id):
             # Unlike YouTube's /live redirect, an offline Twitch channel is
             # reported by yt-dlp as an extractor error. This is an expected
             # state, not a failed monitor check.
-            if is_twitch and 'not currently live' in str(exc).lower():
+            if is_twitch and _is_twitch_offline(exc):
                 return LiveProbeResult('ENDED')
             logger.warning("Live discovery failed via proxy=%s: %s", bool(proxy), exc)
             continue
